@@ -1,0 +1,8 @@
+
+{
+  "name": "Abdul Ahad's Kitchen",
+  "description": "An exquisite dining experience featuring an AI-powered concierge to help you explore our menu and place orders seamlessly.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
