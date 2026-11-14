@@ -1713,16 +1713,6 @@ const App: React.FC = () => {
                   ? 'Manage your orders, menu and visibility in one place. Zero commission on every order.'
                   : 'Discover restaurants, order your favorite dishes, and track every order in real time.'}
               </p>
-              {(import.meta as any).env?.DEV && homeData.neonStatus && (
-                <div className="inline-flex items-center gap-1.5 text-[10px] font-bold px-2.5 py-1 rounded-md rh-surface">
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      homeData.neonStatus.connected ? 'bg-emerald-500' : 'bg-amber-500'
-                    }`}
-                  ></span>
-                  <span>Dev: Neon PostgreSQL {homeData.neonStatus.connected ? 'connected' : 'standby'}</span>
-                </div>
-              )}
             </div>
 
             {user.role !== 'restaurant_owner' && (
