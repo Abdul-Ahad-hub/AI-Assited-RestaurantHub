@@ -1,13 +1,24 @@
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+function resolveDbPath(): string {
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return path.join(os.tmpdir(), 'restaurant_hub.db');
+  }
+  try {
+    const dataDir = path.resolve(process.cwd(), 'data');
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    return path.join(dataDir, 'restaurant_hub.db');
+  } catch {
+    return path.join(os.tmpdir(), 'restaurant_hub.db');
+  }
 }
 
-const DB_PATH = path.join(DATA_DIR, 'restaurant_hub.db');
+const DB_PATH = resolveDbPath();
 
 let dbInstance: DatabaseSync | null = null;
 

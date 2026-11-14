@@ -1,3 +1,5 @@
+import { handleServerlessFallback } from './serverlessFallback';
+
 const TOKEN_KEY = 'rh_auth_token';
 
 export function getAuthToken(): string | null {
@@ -22,14 +24,34 @@ export async function apiFetch<T = any>(path: string, options: RequestInit = {})
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const res = await fetch(path, {
-    ...options,
-    headers
-  });
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      ...options,
+      headers
+    });
+  } catch {
+    // Network unreachable — fall back to client-side serverless runtime
+    return handleServerlessFallback<T>(path, options);
+  }
 
-  const data = await res.json().catch(() => ({}));
+  const contentType = res.headers.get('content-type') || '';
+  const isJson = contentType.includes('application/json');
+  const data = isJson ? await res.json().catch(() => ({})) : {};
+
   if (!res.ok) {
+    // If deployed as a static SPA on Vercel where /api/* returns a static 404 or 5xx,
+    // transparently execute against the persistent client-side serverless runtime.
+    if ((res.status === 404 && !data.error) || res.status >= 500) {
+      return handleServerlessFallback<T>(path, options);
+    }
     throw new Error(data.error || `Request failed with status ${res.status}`);
   }
+
+  // Also guard against SPA fallback returning index.html (200 text/html) for /api/* routes on static hosts
+  if (!isJson && path.startsWith('/api/')) {
+    return handleServerlessFallback<T>(path, options);
+  }
+
   return data as T;
 }

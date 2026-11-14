@@ -41,10 +41,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
 }) => {
   const [isTalkMode, setIsTalkMode] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [isProcessingVoice, setIsProcessingVoice] = useState(false);
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [liveTranscript, setLiveTranscript] = useState('');
   const [voiceStatusText, setVoiceStatusText] = useState('Listening... Speak whenever you are ready');
+  const [voiceNotice, setVoiceNotice] = useState<string>('');
+  const [closingCountdown, setClosingCountdown] = useState<number | null>(null);
   const [micError, setMicError] = useState('');
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [textInput, setTextInput] = useState('');
@@ -54,14 +57,34 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const latestTranscriptRef = useRef('');
   const silenceTimerRef = useRef<any>(null);
+  const restartTimerRef = useRef<any>(null);
+  const closeCountdownRef = useRef<any>(null);
   const keepListeningRef = useRef(false);
   const isProcessingRef = useRef(false);
   const isSpeakingRef = useRef(false);
 
+  // Store parent callbacks in refs so parent re-renders never trigger useEffect cleanup!
+  const onCloseRef = useRef(onClose);
+  const onFormFilledRef = useRef(onFormFilled);
+  const onSearchCompletedRef = useRef(onSearchCompleted);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+    onFormFilledRef.current = onFormFilled;
+    onSearchCompletedRef.current = onSearchCompleted;
+  }, [onClose, onFormFilled, onSearchCompleted]);
+
   const currentRestName = activeRestaurant?.name || 'Restaurant Hub AI';
   const currentRestId = activeRestaurant?.id || 'rest_abdul_ahad';
 
-  const stopVoiceEngine = useCallback(() => {
+  const clearCloseCountdown = useCallback(() => {
+    if (closeCountdownRef.current) {
+      clearInterval(closeCountdownRef.current);
+      closeCountdownRef.current = null;
+    }
+    setClosingCountdown(null);
+  }, []);
+
+  const stopVoiceEngine = useCallback((reasonNotice?: string) => {
     keepListeningRef.current = false;
     isProcessingRef.current = false;
     isSpeakingRef.current = false;
@@ -70,10 +93,21 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    if (closeCountdownRef.current) {
+      clearInterval(closeCountdownRef.current);
+      closeCountdownRef.current = null;
+    }
+    setClosingCountdown(null);
+
     if (recognitionRef.current) {
       try {
         recognitionRef.current.onend = null;
         recognitionRef.current.onerror = null;
+        recognitionRef.current.onresult = null;
         recognitionRef.current.stop();
       } catch {}
       recognitionRef.current = null;
@@ -92,8 +126,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       } catch {}
     }
     setIsListening(false);
+    setIsReconnecting(false);
     setIsAiSpeaking(false);
     setIsProcessingVoice(false);
+    if (reasonNotice) {
+      setVoiceNotice(reasonNotice);
+    }
   }, []);
 
   const speakTextAloud = (text: string, onDone?: () => void) => {
@@ -104,32 +142,57 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
     try {
       window.speechSynthesis.cancel();
       const utter = new SpeechSynthesisUtterance(text);
-      utter.rate = 1.05;
+      utter.rate = 1.04;
+      let finished = false;
+      const finishOnce = () => {
+        if (finished) return;
+        finished = true;
+        isSpeakingRef.current = false;
+        setIsAiSpeaking(false);
+        onDone?.();
+      };
       utter.onstart = () => {
         isSpeakingRef.current = true;
         setIsAiSpeaking(true);
       };
-      utter.onend = () => {
-        isSpeakingRef.current = false;
-        setIsAiSpeaking(false);
-        onDone?.();
-      };
-      utter.onerror = () => {
-        isSpeakingRef.current = false;
-        setIsAiSpeaking(false);
-        onDone?.();
-      };
+      utter.onend = finishOnce;
+      utter.onerror = finishOnce;
       window.speechSynthesis.speak(utter);
+      // Safety fallback in case browser speechSynthesis hangs or is muted
+      setTimeout(finishOnce, Math.max(3000, Math.min(12000, text.length * 75)));
     } catch {
       isSpeakingRef.current = false;
       onDone?.();
     }
   };
 
+  const scheduleGracefulAutoClose = useCallback(() => {
+    clearCloseCountdown();
+    let remaining = 3;
+    setClosingCountdown(remaining);
+    setVoiceNotice('Task completed! Closing voice assistant automatically in 3 seconds...');
+
+    closeCountdownRef.current = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearCloseCountdown();
+        stopVoiceEngine();
+        setIsTalkMode(false);
+        onCloseRef.current();
+      } else {
+        setClosingCountdown(remaining);
+        setVoiceNotice(`Task completed! Closing voice assistant automatically in ${remaining}s...`);
+      }
+    }, 1000);
+  }, [clearCloseCountdown, stopVoiceEngine]);
+
   const executeVoiceTranscript = useCallback(
     async (spokenText: string) => {
       const clean = spokenText.trim();
       if (!clean || isProcessingRef.current) return;
+
+      clearCloseCountdown();
+      setVoiceNotice('');
 
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
@@ -162,9 +225,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
 
         const reply = res.spokenReply || 'Done!';
         setVoiceStatusText(reply);
+        isProcessingRef.current = false;
+        setIsProcessingVoice(false);
 
-        if (res.action === 'form_fill' && res.fields && onFormFilled) {
-          onFormFilled(res.fields);
+        if (res.action === 'form_fill' && res.fields && onFormFilledRef.current) {
+          onFormFilledRef.current(res.fields);
         } else if (res.action === 'search' && res.searchData) {
           setMessages(prev => [
             ...prev,
@@ -176,21 +241,20 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
               foods: res.searchData.foods
             }
           ]);
-          if (onSearchCompleted) {
-            onSearchCompleted(res.searchData);
+          if (onSearchCompletedRef.current) {
+            onSearchCompletedRef.current(res.searchData);
           }
         }
 
         speakTextAloud(reply, () => {
-          stopVoiceEngine();
-          setIsTalkMode(false);
-          onClose();
+          scheduleGracefulAutoClose();
         });
       } catch (err: any) {
         isProcessingRef.current = false;
         setIsProcessingVoice(false);
-        setVoiceStatusText(err?.message || 'Could not process voice command. Keep speaking...');
-        // Resume listening if an error occurred
+        const errMsg = err?.message || 'Could not process voice command.';
+        setVoiceStatusText('Listening... Speak whenever you are ready');
+        setVoiceNotice(`Note: ${errMsg}. Microphone is still active — keep speaking or tap Apply.`);
         if (keepListeningRef.current && recognitionRef.current) {
           try {
             recognitionRef.current.start();
@@ -199,19 +263,18 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         }
       }
     },
-    [
-      voiceFormType,
-      selectedCity,
-      currentRestId,
-      onFormFilled,
-      onSearchCompleted,
-      stopVoiceEngine,
-      onClose
-    ]
+    [voiceFormType, selectedCity, currentRestId, clearCloseCountdown, scheduleGracefulAutoClose]
   );
 
+  const executeVoiceTranscriptRef = useRef(executeVoiceTranscript);
+  useEffect(() => {
+    executeVoiceTranscriptRef.current = executeVoiceTranscript;
+  }, [executeVoiceTranscript]);
+
   const startVoiceEngine = useCallback(async () => {
+    clearCloseCountdown();
     setMicError('');
+    setVoiceNotice('');
     setLiveTranscript('');
     latestTranscriptRef.current = '';
     keepListeningRef.current = true;
@@ -230,96 +293,119 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       }
     } catch {
       setMicError(
-        'Microphone access was blocked or not found. Allow microphone permission in your browser address bar, or use the voice box below.'
+        'Microphone access was blocked or not found. Allow microphone permission in your browser address bar, or type your command below.'
       );
       setVoiceStatusText('Microphone permission needed');
+      setVoiceNotice('Voice listening paused because microphone permission was not granted.');
       return;
     }
 
-    // 2. Start Continuous SpeechRecognition with Auto-Restart on browser timeout
+    // 2. Start Continuous SpeechRecognition with Resilient Auto-Keepalive
     const SpeechRec =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     if (!SpeechRec) {
       setMicError(
-        'Browser SpeechRecognition is available in Chrome and Edge. You can also type or tap a voice command below.'
+        'Browser SpeechRecognition is supported in Chrome and Edge. You can still type or tap a voice command below.'
       );
+      setVoiceNotice('Browser speech recognition is unavailable in this browser.');
       return;
     }
 
-    try {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.onend = null;
-          recognitionRef.current.stop();
-        } catch {}
-      }
-
-      const recognition = new SpeechRec();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      recognition.onstart = () => {
-        setIsListening(true);
-      };
-
-      recognition.onresult = (event: any) => {
-        let combined = '';
-        for (let i = 0; i < event.results.length; i++) {
-          combined += event.results[i][0].transcript + ' ';
+    const createAndStartInstance = () => {
+      if (!keepListeningRef.current) return;
+      try {
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.onend = null;
+            recognitionRef.current.onerror = null;
+            recognitionRef.current.onresult = null;
+            recognitionRef.current.stop();
+          } catch {}
         }
-        const trimmed = combined.trim();
-        if (trimmed) {
-          setLiveTranscript(trimmed);
-          latestTranscriptRef.current = trimmed;
-          setVoiceStatusText('Hearing you...');
 
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          if (trimmed.length >= 5) {
-            silenceTimerRef.current = setTimeout(() => {
-              executeVoiceTranscript(latestTranscriptRef.current);
-            }, 3200);
+        const recognition = new SpeechRec();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
+
+        recognition.onstart = () => {
+          setIsListening(true);
+          setIsReconnecting(false);
+          setVoiceNotice('');
+        };
+
+        recognition.onresult = (event: any) => {
+          let combined = '';
+          for (let i = 0; i < event.results.length; i++) {
+            combined += event.results[i][0].transcript + ' ';
           }
-        }
-      };
+          const trimmed = combined.trim();
+          if (trimmed) {
+            setLiveTranscript(trimmed);
+            latestTranscriptRef.current = trimmed;
+            setVoiceStatusText('Hearing you...');
+            setVoiceNotice('');
 
-      recognition.onerror = (ev: any) => {
-        if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-          keepListeningRef.current = false;
-          setMicError(
-            'Microphone permission was denied. Click the site settings icon in your address bar to allow Microphone.'
-          );
-          setIsListening(false);
-        }
-        // Ignore 'no-speech' errors so onend can seamlessly restart listening!
-      };
-
-      recognition.onend = () => {
-        // CRITICAL FIX: Chrome stops SpeechRecognition after ~6s of silence.
-        // Immediately restart if still in Talk Mode and not processing!
-        if (keepListeningRef.current && !isProcessingRef.current && !isSpeakingRef.current) {
-          setTimeout(() => {
-            if (keepListeningRef.current && !isProcessingRef.current && recognitionRef.current) {
-              try {
-                recognitionRef.current.start();
-                setIsListening(true);
-              } catch {}
+            if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+            if (trimmed.length >= 4) {
+              silenceTimerRef.current = setTimeout(() => {
+                executeVoiceTranscriptRef.current(latestTranscriptRef.current);
+              }, 2800);
             }
-          }, 120);
-        } else {
-          setIsListening(false);
-        }
-      };
+          }
+        };
 
-      recognitionRef.current = recognition;
-      recognition.start();
-      setIsListening(true);
-    } catch (e: any) {
-      setMicError(e?.message || 'Could not start speech recognition.');
-    }
-  }, [voiceFormType, executeVoiceTranscript]);
+        recognition.onerror = (ev: any) => {
+          if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+            keepListeningRef.current = false;
+            setMicError(
+              'Microphone permission was denied. Click the site settings icon in your address bar to allow Microphone.'
+            );
+            setVoiceNotice('Voice session stopped: Microphone permission denied by browser.');
+            setIsListening(false);
+            setIsReconnecting(false);
+          } else if (ev.error === 'audio-capture') {
+            setVoiceNotice('No microphone detected. Check your audio input device or tap Resume.');
+            setIsListening(false);
+          } else if (ev.error === 'network') {
+            setVoiceNotice('Browser speech network hiccup — auto-reconnecting microphone...');
+          }
+          // For 'no-speech' or 'aborted', onend will automatically re-arm listening.
+        };
 
+        recognition.onend = () => {
+          // Chrome/Edge stops SpeechRecognition after ~6s of silence.
+          // Automatically re-arm with a fresh instance while still in Talk Mode!
+          if (keepListeningRef.current && !isProcessingRef.current && !isSpeakingRef.current) {
+            setIsReconnecting(true);
+            if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+            restartTimerRef.current = setTimeout(() => {
+              if (keepListeningRef.current && !isProcessingRef.current && !isSpeakingRef.current) {
+                createAndStartInstance();
+              }
+            }, 180);
+          } else {
+            setIsListening(false);
+            setIsReconnecting(false);
+          }
+        };
+
+        recognitionRef.current = recognition;
+        recognition.start();
+        setIsListening(true);
+        setIsReconnecting(false);
+      } catch (e: any) {
+        setIsListening(false);
+        setIsReconnecting(false);
+        setVoiceNotice('Voice listening paused by browser. Tap the microphone orb or Resume below.');
+      }
+    };
+
+    createAndStartInstance();
+  }, [voiceFormType, clearCloseCountdown]);
+
+  // Only react to `isOpen`, `startInVoiceMode`, or `voiceFormType` changes — never re-run on parent re-renders!
   useEffect(() => {
     if (isOpen && (startInVoiceMode || voiceFormType)) {
       setIsTalkMode(true);
@@ -328,20 +414,30 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       stopVoiceEngine();
       setIsTalkMode(false);
     }
+  }, [isOpen, startInVoiceMode, voiceFormType, startVoiceEngine, stopVoiceEngine]);
+
+  // Cleanup only on unmount
+  useEffect(() => {
     return () => {
       stopVoiceEngine();
     };
-  }, [isOpen, startInVoiceMode, voiceFormType, startVoiceEngine, stopVoiceEngine]);
+  }, [stopVoiceEngine]);
 
   const handleSwitchToTalkMode = () => {
     setIsTalkMode(true);
     startVoiceEngine();
   };
 
+  const handleStayInVoiceMode = () => {
+    clearCloseCountdown();
+    setVoiceNotice('Auto-close cancelled. Listening resumed!');
+    startVoiceEngine();
+  };
+
   const handleCloseTalkMode = () => {
     stopVoiceEngine();
     setIsTalkMode(false);
-    onClose();
+    onCloseRef.current();
   };
 
   const handleSendText = async (e: React.FormEvent) => {
@@ -366,8 +462,8 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
           foods: data.foods
         }
       ]);
-      if (onSearchCompleted) {
-        onSearchCompleted(data);
+      if (onSearchCompletedRef.current) {
+        onSearchCompletedRef.current(data);
       }
     } catch (err: any) {
       setMessages(prev => [
@@ -410,12 +506,31 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   if (isTalkMode) {
     return (
       <div className="rh-voice-fullscreen animate-in fade-in duration-200">
-        {/* Top Bar */}
-        <div className="w-full max-w-2xl flex items-center justify-between">
+        {/* Top Bar with Live Connection Status Badge */}
+        <div className="w-full max-w-2xl flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-2.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-[#a78bfa] animate-ping"></span>
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                isListening || isReconnecting
+                  ? 'bg-emerald-400 animate-ping'
+                  : isProcessingVoice || isAiSpeaking
+                  ? 'bg-[#a78bfa] animate-ping'
+                  : 'bg-amber-400'
+              }`}
+            ></span>
             <span className="text-xs font-extrabold uppercase tracking-widest text-[#c4b5fd]">
               {voiceFormType ? `AI Voice Form Fill (${voiceFormType})` : 'Restaurant Hub Voice AI'}
+            </span>
+            <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-white/10 text-gray-200">
+              {isProcessingVoice
+                ? 'Processing...'
+                : isAiSpeaking
+                ? 'Speaking reply...'
+                : isListening
+                ? 'Mic Active • Auto-Keepalive On'
+                : isReconnecting
+                ? 'Keeping mic active...'
+                : 'Mic Paused'}
             </span>
           </div>
           {!voiceFormType && (
@@ -439,27 +554,65 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
               if (!isListening && !isProcessingVoice) startVoiceEngine();
             }}
             className="rh-ai-orb-wrap cursor-pointer"
-            title="Active Microphone"
+            title="Tap to start or resume microphone"
           >
-            {(isListening || isAiSpeaking) && <div className="rh-ai-orb-ring"></div>}
-            {(isListening || isAiSpeaking) && <div className="rh-ai-orb-ring delay"></div>}
-            <div className={`rh-ai-orb ${isListening || isAiSpeaking || isProcessingVoice ? 'speaking' : ''}`}>
+            {(isListening || isReconnecting || isAiSpeaking) && <div className="rh-ai-orb-ring"></div>}
+            {(isListening || isReconnecting || isAiSpeaking) && <div className="rh-ai-orb-ring delay"></div>}
+            <div
+              className={`rh-ai-orb ${
+                isListening || isReconnecting || isAiSpeaking || isProcessingVoice ? 'speaking' : ''
+              }`}
+            >
               <i
                 className={`fas ${
                   isProcessingVoice
                     ? 'fa-circle-notch fa-spin'
                     : isAiSpeaking
                     ? 'fa-volume-up'
-                    : 'fa-microphone'
+                    : isListening || isReconnecting
+                    ? 'fa-microphone'
+                    : 'fa-microphone-slash'
                 } text-4xl text-white`}
               ></i>
             </div>
           </div>
 
-          <div className="space-y-2">
+          <div className="space-y-3">
             <h2 className="text-xl sm:text-2xl font-extrabold tracking-tight text-white">
               {voiceStatusText}
             </h2>
+
+            {/* Clear Status / Countdown / Pause Indication Banner */}
+            {voiceNotice && (
+              <div className="bg-amber-500/20 border border-amber-400/40 rounded-2xl px-4 py-3 text-xs font-bold text-amber-200 max-w-md mx-auto flex flex-col items-center gap-2">
+                <span>
+                  <i className="fas fa-info-circle mr-1.5"></i>
+                  {voiceNotice}
+                </span>
+                {closingCountdown !== null && (
+                  <button
+                    type="button"
+                    onClick={handleStayInVoiceMode}
+                    className="bg-white text-[#1e1b2e] hover:bg-gray-100 px-3.5 py-1.5 rounded-xl text-xs font-extrabold shadow"
+                  >
+                    Stay in Voice Mode
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Resume button whenever mic is paused */}
+            {!isListening && !isReconnecting && !isProcessingVoice && !isAiSpeaking && closingCountdown === null && (
+              <button
+                type="button"
+                onClick={() => startVoiceEngine()}
+                className="bg-emerald-500 hover:bg-emerald-400 text-white px-5 py-2.5 rounded-full text-xs font-extrabold inline-flex items-center gap-2 shadow-lg"
+              >
+                <i className="fas fa-microphone"></i>
+                <span>Resume Listening</span>
+              </button>
+            )}
+
             {liveTranscript && (
               <div className="bg-white/10 border border-white/20 rounded-2xl px-4 py-3 text-sm font-semibold text-[#c4b5fd]">
                 "{liveTranscript}"
@@ -473,7 +626,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
             )}
           </div>
 
-          {/* Instant Submit or Sample Voice Prompts */}
+          {/* Instant Submit or Voice Command Input */}
           <div className="w-full max-w-md space-y-3 pt-2">
             {liveTranscript && !isProcessingVoice && (
               <button
@@ -512,12 +665,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                 type="button"
                 onClick={() =>
                   executeVoiceTranscript(
-                    'My address is House 14, Street 5, DHA Phase 6 Karachi, phone number is +92 300 1234567, promo code AHAD20, and make it medium spicy'
+                    'My address is House 14, Street 5, DHA Phase 6 Karachi, phone number is +92 300 1234567, promo code ROYAL15, and make it medium spicy'
                   )
                 }
                 className="text-[11px] font-bold text-[#c4b5fd] hover:underline"
               >
-                <i className="fas fa-magic mr-1"></i> Try sample voice fill: "House 14 DHA Phase 6, +92 300 1234567, code AHAD20"
+                <i className="fas fa-magic mr-1"></i> Try sample voice fill: "House 14 DHA Phase 6, +92 300 1234567, code ROYAL15"
               </button>
             )}
           </div>
