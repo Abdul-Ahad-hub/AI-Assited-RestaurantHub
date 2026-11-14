@@ -1,623 +1,673 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI, LiveServerMessage, Modality, Type, FunctionDeclaration } from '@google/genai';
-import { OrderItem } from '../types';
-import { MENU_ITEMS, SYSTEM_INSTRUCTION } from '../constants';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { MenuItem, OrderItem, Restaurant } from '../types';
+import { apiFetch } from '../services/apiClient';
+import { SmartImage } from './SmartImage';
+
+export type VoiceFormFillType = 'checkout' | 'profile' | 'register' | null;
 
 interface ChatInterfaceProps {
-  onOrderPlaced: (items: OrderItem[], address: string, phone: string) => void;
+  onOrderPlaced: (items: OrderItem[], address: string, phone: string, restaurantId?: string) => void;
   isOpen: boolean;
+  onOpen?: () => void;
   onClose: () => void;
+  activeRestaurant?: Restaurant | null;
+  activeMenuItems?: MenuItem[];
+  selectedCity?: string;
+  onSelectRestaurant?: (restaurantIdOrSlug: string) => void;
+  onSearchCompleted?: (results: { answer: string; restaurants: any[]; foods: any[] }) => void;
+  voiceFormType?: VoiceFormFillType;
+  onFormFilled?: (fields: Record<string, string>) => void;
+  startInVoiceMode?: boolean;
 }
 
-function encode(bytes: Uint8Array) {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
+interface ChatTurn {
+  role: 'user' | 'agent';
+  text: string;
+  restaurants?: any[];
+  foods?: any[];
 }
 
-function decode(base64: string) {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
+export const ChatInterface: React.FC<ChatInterfaceProps> = ({
+  isOpen,
+  onOpen,
+  onClose,
+  activeRestaurant,
+  selectedCity = 'All',
+  onSelectRestaurant,
+  onSearchCompleted,
+  voiceFormType = null,
+  onFormFilled,
+  startInVoiceMode = false
+}) => {
+  const [isTalkMode, setIsTalkMode] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [isProcessingVoice, setIsProcessingVoice] = useState(false);
+  const [isAiSpeaking, setIsAiSpeaking] = useState(false);
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const [voiceStatusText, setVoiceStatusText] = useState('Listening... Speak whenever you are ready');
+  const [micError, setMicError] = useState('');
+  const [messages, setMessages] = useState<ChatTurn[]>([]);
+  const [textInput, setTextInput] = useState('');
+  const [isSendingText, setIsSendingText] = useState(false);
 
-async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: number, numChannels: number): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
-  const frameCount = dataInt16.length / numChannels;
-  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-  for (let channel = 0; channel < numChannels; channel++) {
-    const channelData = buffer.getChannelData(channel);
-    for (let i = 0; i < frameCount; i++) {
-      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
-    }
-  }
-  return buffer;
-}
-
-export const ChatInterface: React.FC<ChatInterfaceProps> = ({ onOrderPlaced, isOpen, onClose }) => {
-  const [isActive, setIsActive] = useState(false);
-  const [transcriptions, setTranscriptions] = useState<{ role: string, text: string }[]>([]);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [showOrderSuccess, setShowOrderSuccess] = useState(false);
-  const [orderSuccessMessage, setOrderSuccessMessage] = useState('');
-  
-  const sessionRef = useRef<any>(null);
-  const audioContextsRef = useRef<{ input: AudioContext, output: AudioContext } | null>(null);
-  const nextStartTimeRef = useRef(0);
-  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const recognitionRef = useRef<any>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const latestTranscriptRef = useRef('');
+  const silenceTimerRef = useRef<any>(null);
+  const keepListeningRef = useRef(false);
+  const isProcessingRef = useRef(false);
+  const isSpeakingRef = useRef(false);
 
-  const placeOrderFunction: FunctionDeclaration = {
-    name: 'placeOrder',
-    parameters: {
-      type: Type.OBJECT,
-      description: 'Place a food order with the customer details. Items must be objects with name and quantity.',
-      properties: {
-        items: {
-          type: Type.ARRAY,
-          description: 'Array of order items, each must be an object with name and quantity',
-          items: {
-            type: Type.OBJECT,
-            description: 'An order item with name and quantity',
-            properties: {
-              name: { 
-                type: Type.STRING,
-                description: 'Exact name of the menu item from the available menu'
-              },
-              quantity: { 
-                type: Type.NUMBER,
-                description: 'Number of portions'
-              },
-            },
-            required: ['name', 'quantity'],
-          },
-        },
-        address: {
-          type: Type.STRING,
-          description: 'Full delivery address including street, city, and any landmarks',
-        },
-        phone: {
-          type: Type.STRING,
-          description: 'Phone number for delivery contact',
-        },
-      },
-      required: ['items', 'address', 'phone'],
-    },
-  };
+  const currentRestName = activeRestaurant?.name || 'Restaurant Hub AI';
+  const currentRestId = activeRestaurant?.id || 'rest_abdul_ahad';
 
-  const showOrderAnimation = (message: string) => {
-    setOrderSuccessMessage(message);
-    setShowOrderSuccess(true);
-    
-    setTimeout(() => {
-      setShowOrderSuccess(false);
-    }, 3000);
-  };
+  const stopVoiceEngine = useCallback(() => {
+    keepListeningRef.current = false;
+    isProcessingRef.current = false;
+    isSpeakingRef.current = false;
 
-  const startSession = async () => {
-    setIsConnecting(true);
-    const ai = new GoogleGenAI({ apiKey: (process.env as any).API_KEY });
-    
-    try {
-      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      audioContextsRef.current = { input: inputCtx, output: outputCtx };
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
-
-      const config: any = {
-        responseModalities: [Modality.AUDIO],
-        systemInstruction: SYSTEM_INSTRUCTION,
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        tools: [{ functionDeclarations: [placeOrderFunction] }],
-      };
-
-      console.log('Starting voice session');
-
-      const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-        config,
-        callbacks: {
-          onopen: () => {
-            setIsActive(true);
-            setIsConnecting(false);
-            
-            // Set up audio processing
-            if (audioContextsRef.current && mediaStreamRef.current) {
-              const inputCtx = audioContextsRef.current.input;
-              const source = inputCtx.createMediaStreamSource(mediaStreamRef.current);
-              const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
-              scriptProcessorRef.current = scriptProcessor;
-              
-              scriptProcessor.onaudioprocess = (e) => {
-                const inputData = e.inputBuffer.getChannelData(0);
-                const l = inputData.length;
-                const int16 = new Int16Array(l);
-                for (let i = 0; i < l; i++) int16[i] = inputData[i] * 32768;
-                const pcmBlob = { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' };
-                if (sessionRef.current) {
-                  sessionRef.current.sendRealtimeInput({ media: pcmBlob });
-                }
-              };
-              source.connect(scriptProcessor);
-              scriptProcessor.connect(inputCtx.destination);
-            }
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            console.log('Received message:', {
-              hasModelTurn: !!message.serverContent?.modelTurn,
-              hasToolCall: !!message.toolCall,
-              modelTurnParts: message.serverContent?.modelTurn?.parts,
-              inputTranscription: message.serverContent?.inputTranscription?.text,
-              outputTranscription: message.serverContent?.outputTranscription?.text,
-              interrupted: message.serverContent?.interrupted,
-              fullMessage: message
-            });
-            
-            // Handle audio output
-            if (message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data) {
-              const base64 = message.serverContent.modelTurn.parts[0].inlineData.data;
-              const outputCtx = audioContextsRef.current?.output;
-              if (outputCtx) {
-                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputCtx.currentTime);
-                const audioBuffer = await decodeAudioData(decode(base64), outputCtx, 24000, 1);
-                const source = outputCtx.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(outputCtx.destination);
-                source.start(nextStartTimeRef.current);
-                nextStartTimeRef.current += audioBuffer.duration;
-                sourcesRef.current.add(source);
-                source.onended = () => sourcesRef.current.delete(source);
-              }
-            }
-
-            // Handle interruptions
-            if (message.serverContent?.interrupted) {
-              sourcesRef.current.forEach(s => s.stop());
-              sourcesRef.current.clear();
-              nextStartTimeRef.current = 0;
-            }
-
-            // Handle user input transcription
-            if (message.serverContent?.inputTranscription) {
-              setTranscriptions(prev => [...prev, { role: 'user', text: message.serverContent!.inputTranscription!.text }]);
-            }
-
-            // Handle agent transcription
-            if (message.serverContent?.outputTranscription) {
-              setTranscriptions(prev => [...prev, { role: 'agent', text: message.serverContent!.outputTranscription!.text }]);
-            }
-           
-            // Handle tool calls (ORDER PLACEMENT)
-            if (message.toolCall?.functionCalls) {
-              console.log('🎯 Tool call detected! Function calls:', message.toolCall.functionCalls);
-              
-              for (const fc of message.toolCall.functionCalls) {
-                if (fc.name === 'placeOrder') {
-                  console.log('✅ Processing placeOrder function call');
-                  console.log('Function call args:', JSON.stringify(fc.args, null, 2));
-                  
-                  // Debug: Check the exact structure of items
-                  console.log('Raw function call args structure:', {
-                    args: fc.args,
-                    stringified: JSON.stringify(fc.args, null, 2),
-                    itemsType: typeof fc.args?.items,
-                    itemsIsArray: Array.isArray(fc.args?.items),
-                    firstItem: fc.args?.items?.[0],
-                    firstItemType: typeof fc.args?.items?.[0]
-                  });
-                  
-                  try {
-                    const args = fc.args as any;
-                    
-                    // Validate required fields
-                    if (!args) {
-                      console.error('❌ Args is null or undefined');
-                      throw new Error('No order data provided');
-                    }
-                    
-                    if (!args.items || !Array.isArray(args.items) || args.items.length === 0) {
-                      console.error('❌ Invalid items array:', args.items);
-                      throw new Error('No items in order');
-                    }
-                    
-                    if (!args.address || typeof args.address !== 'string' || args.address.trim() === '') {
-                      console.error('❌ Invalid address:', args.address);
-                      throw new Error('No delivery address provided');
-                    }
-                    
-                    if (!args.phone || typeof args.phone !== 'string' || args.phone.trim() === '') {
-                      console.error('❌ Invalid phone:', args.phone);
-                      throw new Error('No phone number provided');
-                    }
-                    
-                    // Process each item
-                    const finalizedItems: OrderItem[] = args.items
-                      .map((oi: any, index: number) => {
-                        console.log(`Processing item ${index + 1} raw:`, oi);
-                        console.log(`Type of item ${index + 1}:`, typeof oi);
-                        
-                        let itemName = '';
-                        let quantity = 1;
-                        
-                        // Handle different possible formats from AI
-                        if (typeof oi === 'string') {
-                          // Item is a string like "Chicken Biryani"
-                          itemName = oi.trim();
-                          quantity = 1; // Default quantity
-                          console.log(`String item detected: "${itemName}"`);
-                        } else if (typeof oi === 'object' && oi !== null) {
-                          // Item is an object with properties
-                          itemName = String(
-                            oi.name || 
-                            oi.item || 
-                            oi.menuItem || 
-                            oi.product || 
-                            oi.title || 
-                            ''
-                          ).trim();
-                          
-                          quantity = Number(oi.quantity) || 
-                                    Number(oi.qty) || 
-                                    Number(oi.amount) || 
-                                    1;
-                          
-                          console.log(`Object item detected: name="${itemName}", quantity=${quantity}`);
-                        } else {
-                          console.warn(`Unexpected item format:`, oi);
-                          return null;
-                        }
-                        
-                        if (!itemName) {
-                          console.warn('Item name is empty after processing:', oi);
-                          return null;
-                        }
-                        
-                        console.log(`Looking for menu item matching: "${itemName}"`);
-                        
-                        // Clean up item name for matching
-                        const cleanName = itemName.toLowerCase()
-                          .replace(/\b(extra|large|medium|small|spicy|mild|with|without)\b/g, '')
-                          .replace(/[^a-z\s]/g, '')
-                          .trim();
-                        
-                        // Find matching menu item
-                        const menuItem = MENU_ITEMS.find(mi => {
-                          const menuName = mi.name.toLowerCase();
-                          
-                          // Exact match
-                          if (menuName === cleanName) return true;
-                          
-                          // Contains match
-                          if (menuName.includes(cleanName) || cleanName.includes(menuName)) return true;
-                          
-                          // Word-by-word matching
-                          const menuWords = menuName.split(/\s+/);
-                          const itemWords = cleanName.split(/\s+/);
-                          
-                          // Check if any significant word matches
-                          const significantMatch = menuWords.some(mw => 
-                            mw.length > 3 && itemWords.some(iw => iw.includes(mw) || mw.includes(iw))
-                          );
-                          
-                          return significantMatch;
-                        });
-                        
-                        if (!menuItem) {
-                          console.warn(`No menu item found for: "${itemName}" (cleaned: "${cleanName}")`);
-                          console.log('Available menu items:', MENU_ITEMS.map(m => m.name));
-                          
-                          // Try partial matching as fallback
-                          const partialMatch = MENU_ITEMS.find(mi => 
-                            mi.name.toLowerCase().includes(cleanName.split(' ')[0]) ||
-                            cleanName.includes(mi.name.toLowerCase().split(' ')[0])
-                          );
-                          
-                          if (partialMatch) {
-                            console.log(`Found partial match: ${partialMatch.name} for "${itemName}"`);
-                            return {
-                              name: partialMatch.name,
-                              quantity,
-                              price: partialMatch.price
-                            };
-                          }
-                          
-                          // Return custom item
-                          return {
-                            name: itemName,
-                            quantity,
-                            price: 0
-                          };
-                        }
-                        
-                        console.log(`✅ Matched: "${itemName}" -> "${menuItem.name}"`);
-                        
-                        return {
-                          name: menuItem.name,
-                          quantity,
-                          price: menuItem.price
-                        };
-                      })
-                      .filter((item): item is OrderItem => item !== null);
-                    
-                    if (finalizedItems.length === 0) {
-                      throw new Error('No valid items could be processed from the order');
-                    }
-                    
-                    console.log('✅ Finalized order items:', finalizedItems);
-                    console.log('✅ Delivery address:', args.address);
-                    console.log('✅ Phone number:', args.phone);
-                    
-                    // Calculate total
-                    const total = finalizedItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-                    console.log(`✅ Total order value: $${total.toFixed(2)}`);
-                    
-                    // Call parent callback
-                    onOrderPlaced(finalizedItems, args.address.trim(), args.phone.trim());
-                    
-                    // Show success animation
-                    const itemCount = finalizedItems.reduce((sum, item) => sum + item.quantity, 0);
-                    showOrderAnimation(`✅ Order confirmed! ${itemCount} items ($${total.toFixed(2)}) on their way to ${args.address}`);
-                    
-                    // Send success response back to AI
-                    if (sessionRef.current) {
-                      console.log('📤 Sending success response to AI');
-                      sessionRef.current.sendToolResponse({
-                        functionResponses: [{
-                          id: fc.id,
-                          name: fc.name,
-                          response: { 
-                            result: `Order confirmed successfully! ${itemCount} items totaling $${total.toFixed(2)} will be delivered to ${args.address}.`
-                          }
-                        }]
-                      });
-                    }
-                    
-                  } catch (error) {
-                    console.error('❌ Error processing order:', error);
-                    
-                    // Send error response to AI
-                    if (sessionRef.current) {
-                      sessionRef.current.sendToolResponse({
-                        functionResponses: [{
-                          id: fc.id,
-                          name: fc.name,
-                          response: { 
-                            error: "Failed to process order. Please try again.",
-                            details: error instanceof Error ? error.message : String(error)
-                          }
-                        }]
-                      });
-                    }
-                    
-                    // Show error message in chat
-                    setTranscriptions(prev => [...prev, { 
-                      role: 'agent', 
-                      text: "I encountered an error processing your order. Please try again or provide more details." 
-                    }]);
-                  }
-                } else {
-                  console.warn(`Unknown function call: ${fc.name}`);
-                }
-              }
-            }
-          },
-          onclose: () => {
-            console.log('Session closed');
-            setIsActive(false);
-          },
-          onerror: (e: any) => {
-            console.error('Session error:', e);
-            setIsActive(false);
-            setIsConnecting(false);
-          }
-        }
-      });
-
-      sessionRef.current = await sessionPromise;
-    } catch (error) {
-      console.error('Failed to start session:', error);
-      setIsConnecting(false);
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
     }
-  };
-
-  const stopSession = () => {
-    console.log('Stopping session');
-    
-    if (sessionRef.current) {
+    if (recognitionRef.current) {
       try {
-        sessionRef.current.close();
-      } catch (error) {
-        console.error('Error closing session:', error);
-      }
-      sessionRef.current = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.stop();
+      } catch {}
+      recognitionRef.current = null;
     }
-    
-    // Clean up audio resources
-    sourcesRef.current.forEach(s => {
-      try {
-        s.stop();
-      } catch (error) {
-        console.error('Error stopping audio source:', error);
-      }
-    });
-    sourcesRef.current.clear();
-    
-    if (scriptProcessorRef.current) {
-      try {
-        scriptProcessorRef.current.disconnect();
-      } catch (error) {
-        console.error('Error disconnecting script processor:', error);
-      }
-      scriptProcessorRef.current = null;
-    }
-    
     if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => {
+      mediaStreamRef.current.getTracks().forEach(t => {
         try {
-          track.stop();
-        } catch (error) {
-          console.error('Error stopping media track:', error);
-        }
+          t.stop();
+        } catch {}
       });
       mediaStreamRef.current = null;
     }
-    
-    if (audioContextsRef.current) {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       try {
-        audioContextsRef.current.input.close();
-        audioContextsRef.current.output.close();
-      } catch (error) {
-        console.error('Error closing audio contexts:', error);
-      }
-      audioContextsRef.current = null;
+        window.speechSynthesis.cancel();
+      } catch {}
     }
-    
-    nextStartTimeRef.current = 0;
-    
-    setIsActive(false);
-    setIsConnecting(false);
+    setIsListening(false);
+    setIsAiSpeaking(false);
+    setIsProcessingVoice(false);
+  }, []);
+
+  const speakTextAloud = (text: string, onDone?: () => void) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      onDone?.();
+      return;
+    }
+    try {
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.rate = 1.05;
+      utter.onstart = () => {
+        isSpeakingRef.current = true;
+        setIsAiSpeaking(true);
+      };
+      utter.onend = () => {
+        isSpeakingRef.current = false;
+        setIsAiSpeaking(false);
+        onDone?.();
+      };
+      utter.onerror = () => {
+        isSpeakingRef.current = false;
+        setIsAiSpeaking(false);
+        onDone?.();
+      };
+      window.speechSynthesis.speak(utter);
+    } catch {
+      isSpeakingRef.current = false;
+      onDone?.();
+    }
   };
 
-  useEffect(() => {
-    if (isOpen && !isActive) {
-      startSession();
-    }
-    
-    return () => {
-      if (!isOpen) {
-        stopSession();
+  const executeVoiceTranscript = useCallback(
+    async (spokenText: string) => {
+      const clean = spokenText.trim();
+      if (!clean || isProcessingRef.current) return;
+
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
       }
+
+      isProcessingRef.current = true;
+      setIsProcessingVoice(true);
+
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+      }
+      setIsListening(false);
+      setVoiceStatusText(
+        voiceFormType ? 'Extracting and filling form fields...' : 'Executing your request...'
+      );
+
+      try {
+        const res = await apiFetch('/api/ai/voice-command', {
+          method: 'POST',
+          body: JSON.stringify({
+            transcript: clean,
+            formType: voiceFormType,
+            city: selectedCity,
+            restaurantId: currentRestId
+          })
+        });
+
+        const reply = res.spokenReply || 'Done!';
+        setVoiceStatusText(reply);
+
+        if (res.action === 'form_fill' && res.fields && onFormFilled) {
+          onFormFilled(res.fields);
+        } else if (res.action === 'search' && res.searchData) {
+          setMessages(prev => [
+            ...prev,
+            { role: 'user', text: clean },
+            {
+              role: 'agent',
+              text: res.searchData.answer,
+              restaurants: res.searchData.restaurants,
+              foods: res.searchData.foods
+            }
+          ]);
+          if (onSearchCompleted) {
+            onSearchCompleted(res.searchData);
+          }
+        }
+
+        speakTextAloud(reply, () => {
+          stopVoiceEngine();
+          setIsTalkMode(false);
+          onClose();
+        });
+      } catch (err: any) {
+        isProcessingRef.current = false;
+        setIsProcessingVoice(false);
+        setVoiceStatusText(err?.message || 'Could not process voice command. Keep speaking...');
+        // Resume listening if an error occurred
+        if (keepListeningRef.current && recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+            setIsListening(true);
+          } catch {}
+        }
+      }
+    },
+    [
+      voiceFormType,
+      selectedCity,
+      currentRestId,
+      onFormFilled,
+      onSearchCompleted,
+      stopVoiceEngine,
+      onClose
+    ]
+  );
+
+  const startVoiceEngine = useCallback(async () => {
+    setMicError('');
+    setLiveTranscript('');
+    latestTranscriptRef.current = '';
+    keepListeningRef.current = true;
+    isProcessingRef.current = false;
+    setVoiceStatusText(
+      voiceFormType
+        ? 'Speak your form details (name, phone, address, notes)...'
+        : 'Listening continuously... Speak whenever you are ready'
+    );
+
+    // 1. Verify microphone permission
+    try {
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia && !mediaStreamRef.current) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStreamRef.current = stream;
+      }
+    } catch {
+      setMicError(
+        'Microphone access was blocked or not found. Allow microphone permission in your browser address bar, or use the voice box below.'
+      );
+      setVoiceStatusText('Microphone permission needed');
+      return;
+    }
+
+    // 2. Start Continuous SpeechRecognition with Auto-Restart on browser timeout
+    const SpeechRec =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRec) {
+      setMicError(
+        'Browser SpeechRecognition is available in Chrome and Edge. You can also type or tap a voice command below.'
+      );
+      return;
+    }
+
+    try {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.onend = null;
+          recognitionRef.current.stop();
+        } catch {}
+      }
+
+      const recognition = new SpeechRec();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => {
+        setIsListening(true);
+      };
+
+      recognition.onresult = (event: any) => {
+        let combined = '';
+        for (let i = 0; i < event.results.length; i++) {
+          combined += event.results[i][0].transcript + ' ';
+        }
+        const trimmed = combined.trim();
+        if (trimmed) {
+          setLiveTranscript(trimmed);
+          latestTranscriptRef.current = trimmed;
+          setVoiceStatusText('Hearing you...');
+
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          if (trimmed.length >= 5) {
+            silenceTimerRef.current = setTimeout(() => {
+              executeVoiceTranscript(latestTranscriptRef.current);
+            }, 3200);
+          }
+        }
+      };
+
+      recognition.onerror = (ev: any) => {
+        if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+          keepListeningRef.current = false;
+          setMicError(
+            'Microphone permission was denied. Click the site settings icon in your address bar to allow Microphone.'
+          );
+          setIsListening(false);
+        }
+        // Ignore 'no-speech' errors so onend can seamlessly restart listening!
+      };
+
+      recognition.onend = () => {
+        // CRITICAL FIX: Chrome stops SpeechRecognition after ~6s of silence.
+        // Immediately restart if still in Talk Mode and not processing!
+        if (keepListeningRef.current && !isProcessingRef.current && !isSpeakingRef.current) {
+          setTimeout(() => {
+            if (keepListeningRef.current && !isProcessingRef.current && recognitionRef.current) {
+              try {
+                recognitionRef.current.start();
+                setIsListening(true);
+              } catch {}
+            }
+          }, 120);
+        } else {
+          setIsListening(false);
+        }
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+      setIsListening(true);
+    } catch (e: any) {
+      setMicError(e?.message || 'Could not start speech recognition.');
+    }
+  }, [voiceFormType, executeVoiceTranscript]);
+
+  useEffect(() => {
+    if (isOpen && (startInVoiceMode || voiceFormType)) {
+      setIsTalkMode(true);
+      startVoiceEngine();
+    } else if (!isOpen) {
+      stopVoiceEngine();
+      setIsTalkMode(false);
+    }
+    return () => {
+      stopVoiceEngine();
     };
-  }, [isOpen]);
+  }, [isOpen, startInVoiceMode, voiceFormType, startVoiceEngine, stopVoiceEngine]);
 
-  if (!isOpen) return null;
+  const handleSwitchToTalkMode = () => {
+    setIsTalkMode(true);
+    startVoiceEngine();
+  };
 
-  return (
-    <div className="fixed inset-0 bg-orange-900/10 backdrop-blur-sm z-50 flex justify-end animate-in fade-in duration-300">
-      {/* Order Success Animation */}
-      {showOrderSuccess && (
-        <div className="fixed inset-0 flex items-center justify-center z-[60]">
-          <div className="absolute inset-0 bg-black/30"></div>
-          <div className="relative bg-white rounded-2xl p-8 max-w-sm mx-4 shadow-2xl animate-in zoom-in duration-300">
-            <div className="text-center">
-              <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4 animate-pulse">
-                <i className="fas fa-check text-green-600 text-3xl"></i>
-              </div>
-              <h3 className="text-xl font-black text-gray-800 mb-2">🎉 Order Confirmed!</h3>
-              <p className="text-gray-600 mb-4">{orderSuccessMessage}</p>
-              <div className="flex space-x-2 justify-center">
-                <div className="w-2 h-2 bg-green-500 rounded-full animate-bounce"></div>
-                <div className="w-2 h-2 bg-green-500 rounded-full animate-bounce delay-100"></div>
-                <div className="w-2 h-2 bg-green-500 rounded-full animate-bounce delay-200"></div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+  const handleCloseTalkMode = () => {
+    stopVoiceEngine();
+    setIsTalkMode(false);
+    onClose();
+  };
 
-      <div className="w-full max-w-md h-full bg-white shadow-2xl flex flex-col overflow-hidden border-l border-orange-100">
-        <div className="p-6 orange-gradient text-white flex justify-between items-center">
-          <div className="flex items-center space-x-3">
-            <div className={`w-10 h-10 rounded-full flex items-center justify-center ${isActive ? 'bg-white text-orange-600 animate-pulse' : 'bg-white/20'}`}>
-              <i className={`fas ${isActive ? 'fa-microphone' : 'fa-microphone-slash'}`}></i>
-            </div>
-            <div>
-              <h2 className="text-lg font-black uppercase tracking-tight">Voice Agent</h2>
-              <p className="text-[10px] font-bold opacity-80 uppercase tracking-widest">
-                {isConnecting ? 'Connecting...' : isActive ? 'Listening' : 'Disconnected'}
-              </p>
-            </div>
-          </div>
-          <button 
-            onClick={onClose} 
-            className="w-10 h-10 rounded-full hover:bg-white/10 flex items-center justify-center transition-colors"
-          >
-            <i className="fas fa-times"></i>
-          </button>
-        </div>
+  const handleSendText = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const q = textInput.trim();
+    if (!q || isSendingText) return;
+    setTextInput('');
+    setMessages(prev => [...prev, { role: 'user', text: q }]);
+    setIsSendingText(true);
 
-        <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-orange-50/20">
-          {isConnecting && (
-            <div className="text-center pt-20">
-              <div className="flex justify-center space-x-2 mb-4">
-                <div className="w-3 h-3 bg-orange-400 rounded-full animate-bounce"></div>
-                <div className="w-3 h-3 bg-orange-400 rounded-full animate-bounce delay-100"></div>
-                <div className="w-3 h-3 bg-orange-400 rounded-full animate-bounce delay-200"></div>
-              </div>
-              <p className="text-sm text-gray-500">
-                Starting voice session...
-              </p>
-              <p className="text-xs text-gray-400 mt-2">
-                Please wait while we connect to the voice assistant...
-              </p>
-            </div>
-          )}
+    try {
+      const data = await apiFetch('/api/ai/discovery', {
+        method: 'POST',
+        body: JSON.stringify({ query: q, city: selectedCity })
+      });
+      setMessages(prev => [
+        ...prev,
+        {
+          role: 'agent',
+          text: data.answer,
+          restaurants: data.restaurants,
+          foods: data.foods
+        }
+      ]);
+      if (onSearchCompleted) {
+        onSearchCompleted(data);
+      }
+    } catch (err: any) {
+      setMessages(prev => [
+        ...prev,
+        {
+          role: 'agent',
+          text: err?.message || 'Unable to process request right now.'
+        }
+      ]);
+    } finally {
+      setIsSendingText(false);
+    }
+  };
 
-          {!isConnecting && transcriptions.length === 0 && isActive && (
-            <div className="text-center pt-20">
-              <div className="w-16 h-16 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <i className="fas fa-microphone-alt text-orange-500 text-xl"></i>
-              </div>
-              <p className="text-[10px] text-gray-400 uppercase tracking-widest mb-2">Voice Assistant Ready</p>
-              <p className="text-xs text-gray-500 max-w-xs mx-auto">
-                Speak clearly and tell me your order. Include items, address, and phone number.
-              </p>
-            </div>
-          )}
+  // =========================================================================
+  // 1. FLOATING BOTTOM-RIGHT LAUNCHER BUTTON WHEN CLOSED
+  // =========================================================================
+  if (!isOpen) {
+    return (
+      <button
+        type="button"
+        onClick={onOpen}
+        className="rh-ai-fab"
+        title="Tell me what you want and I will place your order"
+      >
+        <span className="w-7 h-7 rounded-full bg-white/20 flex items-center justify-center">
+          <i className="fas fa-comment-dots text-sm"></i>
+        </span>
+        <span className="flex flex-col items-start leading-tight text-left">
+          <span className="text-[13px] font-extrabold">I'm here. Skip the clicking.</span>
+          <span className="text-[10px] font-semibold opacity-90">Just tell me, I'll place your order</span>
+        </span>
+      </button>
+    );
+  }
 
-          {transcriptions.map((t, i) => (
-            <div key={i} className={`flex ${t.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm ${
-                t.role === 'user' 
-                  ? 'bg-orange-600 text-white font-medium' 
-                  : 'bg-white text-gray-700 border border-orange-100 shadow-sm'
-              }`}>
-                {t.text}
-                {t.role === 'agent' && i === transcriptions.length - 1 && (
-                  <div className="flex space-x-1 mt-2">
-                    <div className="w-1.5 h-1.5 bg-orange-400 rounded-full animate-pulse"></div>
-                    <div className="w-1.5 h-1.5 bg-orange-400 rounded-full animate-pulse delay-150"></div>
-                    <div className="w-1.5 h-1.5 bg-orange-400 rounded-full animate-pulse delay-300"></div>
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div className="p-6 bg-white border-t border-orange-50">
-          <div className="text-center">
-            <div className="inline-flex items-center justify-center p-4 bg-orange-100 rounded-2xl mb-4">
-              <i className="fas fa-microphone text-orange-600 text-2xl"></i>
-            </div>
-            <p className="text-xs text-gray-500 mb-4">
-              {isActive ? 'Speak now...' : 'Connecting to voice assistant...'}
-            </p>
-          </div>
-          
-          <div className="mt-4 flex justify-center items-center space-x-4">
-            <div className="flex space-x-2">
-              <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-green-500 animate-pulse' : 'bg-gray-200'}`}></div>
-              <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-green-500 animate-pulse delay-150' : 'bg-gray-200'}`}></div>
-              <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-green-500 animate-pulse delay-300' : 'bg-gray-200'}`}></div>
-            </div>
-            <span className="text-xs text-gray-500">
-              {isConnecting ? 'Connecting...' : isActive ? 'Listening ✓' : 'Disconnected'}
+  // =========================================================================
+  // 2. FULLSCREEN CHATGPT-STYLE TALKING AI OVERLAY (WHEN IN TALK MODE)
+  // =========================================================================
+  if (isTalkMode) {
+    return (
+      <div className="rh-voice-fullscreen animate-in fade-in duration-200">
+        {/* Top Bar */}
+        <div className="w-full max-w-2xl flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-[#a78bfa] animate-ping"></span>
+            <span className="text-xs font-extrabold uppercase tracking-widest text-[#c4b5fd]">
+              {voiceFormType ? `AI Voice Form Fill (${voiceFormType})` : 'Restaurant Hub Voice AI'}
             </span>
           </div>
+          {!voiceFormType && (
+            <button
+              type="button"
+              onClick={() => {
+                stopVoiceEngine();
+                setIsTalkMode(false);
+              }}
+              className="text-xs font-bold text-gray-300 hover:text-white bg-white/10 px-3.5 py-2 rounded-xl"
+            >
+              Switch to Chat
+            </button>
+          )}
+        </div>
+
+        {/* Center Pulsing AI Sign / Orb */}
+        <div className="flex flex-col items-center justify-center text-center my-auto space-y-6 max-w-xl w-full px-4">
+          <div
+            onClick={() => {
+              if (!isListening && !isProcessingVoice) startVoiceEngine();
+            }}
+            className="rh-ai-orb-wrap cursor-pointer"
+            title="Active Microphone"
+          >
+            {(isListening || isAiSpeaking) && <div className="rh-ai-orb-ring"></div>}
+            {(isListening || isAiSpeaking) && <div className="rh-ai-orb-ring delay"></div>}
+            <div className={`rh-ai-orb ${isListening || isAiSpeaking || isProcessingVoice ? 'speaking' : ''}`}>
+              <i
+                className={`fas ${
+                  isProcessingVoice
+                    ? 'fa-circle-notch fa-spin'
+                    : isAiSpeaking
+                    ? 'fa-volume-up'
+                    : 'fa-microphone'
+                } text-4xl text-white`}
+              ></i>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <h2 className="text-xl sm:text-2xl font-extrabold tracking-tight text-white">
+              {voiceStatusText}
+            </h2>
+            {liveTranscript && (
+              <div className="bg-white/10 border border-white/20 rounded-2xl px-4 py-3 text-sm font-semibold text-[#c4b5fd]">
+                "{liveTranscript}"
+              </div>
+            )}
+            {micError && (
+              <div className="bg-red-500/20 border border-red-400/40 rounded-xl p-3 text-xs text-red-200 max-w-md mx-auto">
+                <i className="fas fa-exclamation-circle mr-1.5"></i>
+                {micError}
+              </div>
+            )}
+          </div>
+
+          {/* Instant Submit or Sample Voice Prompts */}
+          <div className="w-full max-w-md space-y-3 pt-2">
+            {liveTranscript && !isProcessingVoice && (
+              <button
+                type="button"
+                onClick={() => executeVoiceTranscript(liveTranscript)}
+                className="rh-btn-primary px-6 py-2.5 rounded-full text-xs font-extrabold"
+              >
+                Done Speaking • Apply Now
+              </button>
+            )}
+
+            <div className="bg-white/10 border border-white/15 rounded-2xl p-2 flex items-center gap-2">
+              <input
+                type="text"
+                value={liveTranscript}
+                onChange={e => setLiveTranscript(e.target.value)}
+                placeholder={
+                  voiceFormType
+                    ? 'Speak into mic or type e.g. "Address House 12 DHA Phase 6, phone 03001234567"'
+                    : 'Speak into mic or type a voice command...'
+                }
+                className="flex-1 bg-transparent px-3 py-1.5 text-xs text-white placeholder-gray-400 outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => executeVoiceTranscript(liveTranscript)}
+                disabled={!liveTranscript.trim() || isProcessingVoice}
+                className="rh-btn-primary px-4 py-2 rounded-xl text-xs font-extrabold disabled:opacity-40"
+              >
+                Apply
+              </button>
+            </div>
+
+            {voiceFormType === 'checkout' && (
+              <button
+                type="button"
+                onClick={() =>
+                  executeVoiceTranscript(
+                    'My address is House 14, Street 5, DHA Phase 6 Karachi, phone number is +92 300 1234567, promo code AHAD20, and make it medium spicy'
+                  )
+                }
+                className="text-[11px] font-bold text-[#c4b5fd] hover:underline"
+              >
+                <i className="fas fa-magic mr-1"></i> Try sample voice fill: "House 14 DHA Phase 6, +92 300 1234567, code AHAD20"
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Bottom Close / Turn Off Talking AI Control */}
+        <div className="w-full max-w-md flex flex-col items-center gap-2">
+          <button
+            type="button"
+            onClick={handleCloseTalkMode}
+            className="w-14 h-14 rounded-full bg-red-600 hover:bg-red-500 text-white flex items-center justify-center shadow-2xl transition-transform active:scale-95"
+            title="Close AI & Turn Off Microphone"
+          >
+            <i className="fas fa-times text-xl"></i>
+          </button>
+          <span className="text-[11px] font-bold text-gray-400 uppercase tracking-wider">
+            Close AI
+          </span>
         </div>
       </div>
+    );
+  }
+
+  // =========================================================================
+  // 3. BOTTOM-RIGHT POPUP CHAT WIDGET (DEFAULT CHAT MODE, EMPTY PRE-CHAT)
+  // =========================================================================
+  return (
+    <div className="rh-ai-popup animate-in fade-in duration-150">
+      {/* Header */}
+      <div className="p-4 rh-hero-gradient text-white flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-xl bg-white/20 flex items-center justify-center">
+            <i className="fas fa-comment-dots text-white text-sm"></i>
+          </div>
+          <div>
+            <h2 className="text-xs sm:text-sm font-extrabold tracking-tight">Why do it manually?</h2>
+            <p className="text-[10px] opacity-90 truncate max-w-[140px]">{currentRestName}</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={handleSwitchToTalkMode}
+            className="bg-white text-[#7c3aed] hover:bg-purple-50 px-2.5 py-1.5 rounded-lg text-[11px] font-extrabold flex items-center gap-1.5 shadow-sm transition-colors"
+          >
+            <i className="fas fa-microphone"></i>
+            <span>Switch to Talk</span>
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-7 h-7 rounded-lg bg-white/15 hover:bg-white/25 flex items-center justify-center"
+            aria-label="Close AI"
+          >
+            <i className="fas fa-times text-xs"></i>
+          </button>
+        </div>
+      </div>
+
+      {/* Chat Messages Area (Clean Empty Pre-Chat State) */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-[#faf9fe] dark:bg-[#0f0d17]">
+        {messages.map((m, i) => (
+          <div
+            key={i}
+            className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}
+          >
+            <div
+              className={`max-w-[86%] px-3.5 py-2.5 rounded-2xl text-xs leading-relaxed ${
+                m.role === 'user'
+                  ? 'rh-btn-primary text-white font-semibold'
+                  : 'bg-white dark:bg-[#1d192b] text-[#1e1b2e] dark:text-[#f3f0ff] border border-[#e4e1ee] dark:border-[#322b47] shadow-sm'
+              }`}
+            >
+              {m.text}
+            </div>
+
+            {m.restaurants && m.restaurants.length > 0 && (
+              <div className="w-full mt-2 space-y-1.5">
+                {m.restaurants.map((r: any) => (
+                  <div
+                    key={r.id}
+                    onClick={() => {
+                      if (onSelectRestaurant) {
+                        onSelectRestaurant(r.id);
+                        onClose();
+                      }
+                    }}
+                    className="bg-white dark:bg-[#1d192b] p-2.5 rounded-xl border border-[#e4e1ee] dark:border-[#322b47] hover:border-[#7c3aed] cursor-pointer flex items-center gap-2.5 transition-all"
+                  >
+                    <SmartImage
+                      src={r.cover_url || r.logo_url}
+                      alt={r.name}
+                      fallbackLabel={r.name}
+                      className="w-11 h-11 rounded-lg object-cover shrink-0"
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between gap-2">
+                        <h4 className="text-xs font-extrabold truncate">{r.name}</h4>
+                        <span className="text-[11px] font-bold text-[#7c3aed] dark:text-[#a78bfa]">
+                          ★ {Number(r.rating_avg).toFixed(1)}
+                        </span>
+                      </div>
+                      <p className="text-[10px] rh-text-muted truncate">
+                        {r.cuisine} • {r.area}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+
+        {isSendingText && (
+          <div className="text-xs font-semibold text-[#7c3aed] dark:text-[#a78bfa] flex items-center gap-2 px-2">
+            <i className="fas fa-circle-notch fa-spin"></i>
+            Thinking...
+          </div>
+        )}
+      </div>
+
+      {/* Input Bar */}
+      <form
+        onSubmit={handleSendText}
+        className="p-3 bg-white dark:bg-[#1d192b] border-t border-[#e4e1ee] dark:border-[#322b47] flex items-center gap-2 shrink-0"
+      >
+        <input
+          type="text"
+          value={textInput}
+          onChange={e => setTextInput(e.target.value)}
+          placeholder="Tell me what you feel like eating..."
+          className="flex-1 bg-[#f3f1f9] dark:bg-[#181524] border border-[#e4e1ee] dark:border-[#322b47] rounded-xl px-3.5 py-2 text-xs outline-none focus:border-[#7c3aed]"
+        />
+        <button
+          type="button"
+          onClick={handleSwitchToTalkMode}
+          className="w-9 h-9 rounded-xl bg-[#f5f3ff] dark:bg-[#7c3aed]/20 text-[#7c3aed] dark:text-[#a78bfa] flex items-center justify-center hover:opacity-85"
+          title="Switch to Talk Mode"
+        >
+          <i className="fas fa-microphone text-xs"></i>
+        </button>
+        <button
+          type="submit"
+          disabled={!textInput.trim() || isSendingText}
+          className="rh-btn-primary px-3.5 py-2 rounded-xl text-xs font-extrabold disabled:opacity-40"
+        >
+          <i className="fas fa-paper-plane"></i>
+        </button>
+      </form>
     </div>
   );
 };
