@@ -1,4 +1,4 @@
-# Restaurant Hub (Smart AI Receptionist)
+# Restaurant Hub (with Smart AI Receptionist)
 
 **Restaurant Hub** is a full-stack, role-based restaurant discovery, ordering, and commission-free marketplace platform powered by a **Text & Live Voice AI Concierge**.
 
