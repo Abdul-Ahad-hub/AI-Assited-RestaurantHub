@@ -189,7 +189,50 @@ async function runVerification() {
     assert.ok(adminRes.data.restaurants.length >= 8);
     console.log('   ✓ Admin Console overview & governance endpoints verified');
 
-    console.log('\nALL 9 END-TO-END WORKFLOW SUITES PASSED SUCCESSFULLY!');
+    console.log('10. Testing Dummy AI 5-Message Rate Limit vs Real Signed-In User...');
+    for (let i = 1; i <= 5; i++) {
+      const r = await callApi(
+        '/api/ai/discovery',
+        { method: 'POST', body: JSON.stringify({ query: `Best biryani query ${i}`, city: 'Karachi' }) },
+        custToken
+      );
+      assert.strictEqual(r.status, 200, `Dummy AI message #${i} should succeed`);
+      assert.strictEqual(r.data.demoAiUsage?.remaining, 5 - i, `Remaining should be ${5 - i}`);
+    }
+    const sixthDummy = await callApi(
+      '/api/ai/discovery',
+      { method: 'POST', body: JSON.stringify({ query: '6th message should prompt sign in', city: 'Karachi' }) },
+      custToken
+    );
+    assert.strictEqual(sixthDummy.status, 429, '6th dummy AI message must be rate-limited with 429');
+    assert.strictEqual(sixthDummy.data.code, 'DEMO_AI_LIMIT_REACHED');
+    assert.strictEqual(sixthDummy.data.requiresSignIn, true);
+
+    const uniqueEmail = `real_ai_test_${Date.now()}@example.com`;
+    const realReg = await callApi('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'Real AI Tester',
+        email: uniqueEmail,
+        password: 'Password123!',
+        role: 'customer',
+        city: 'Karachi'
+      })
+    });
+    assert.strictEqual(realReg.status, 201);
+    const realToken = realReg.data.token;
+    for (let i = 1; i <= 6; i++) {
+      const r = await callApi(
+        '/api/ai/discovery',
+        { method: 'POST', body: JSON.stringify({ query: `Real user AI query ${i}`, city: 'Karachi' }) },
+        realToken
+      );
+      assert.strictEqual(r.status, 200, `Real user AI message #${i} must not hit dummy cap`);
+      assert.strictEqual(r.data.demoAiUsage, undefined);
+    }
+    console.log('   ✓ Dummy 5-message AI limit (429 + sign-in prompt) & real user bypass verified');
+
+    console.log('\nALL 10 END-TO-END WORKFLOW SUITES PASSED SUCCESSFULLY!');
   } finally {
     server.close();
   }

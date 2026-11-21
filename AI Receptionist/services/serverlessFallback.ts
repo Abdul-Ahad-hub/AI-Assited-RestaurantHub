@@ -7,8 +7,18 @@
 // `/api/*` routes with the exact same RBAC, dynamic scaling bidding rules,
 // separation of demo vs. real users, order lifecycle, and AI concierge responses.
 
+import { Type } from '@google/genai';
+import { generateWithFreeModelFailover } from './geminiModelRouter';
+
 const STORAGE_KEY = 'rh_serverless_store_v2';
 const TOKEN_KEY = 'rh_auth_token';
+const DUMMY_AI_MESSAGE_LIMIT = 5;
+
+function getBrowserGeminiKey(): string {
+  const key = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
+  if (!key || key === 'PLACEHOLDER_API_KEY') return '';
+  return key;
+}
 
 const DEFAULT_OPENING_BID = 0.1;
 const DEFAULT_STEP_FLOOR = 0.01;
@@ -78,6 +88,7 @@ interface StoreState {
   payments: any[];
   notifications: any[];
   auditLogs: any[];
+  demoAiCounts?: Record<string, number>;
 }
 
 function buildInitialStore(): StoreState {
@@ -716,6 +727,51 @@ function isRealNonDummyUser(user: any): boolean {
   return !SEED_USER_IDS.has(user.id);
 }
 
+function getFallbackDemoAiUsage(state: StoreState, token: string, user: any) {
+  if (isRealNonDummyUser(user)) {
+    return { isDemo: false, used: 0, limit: null as number | null, remaining: null as number | null };
+  }
+  const counts = state.demoAiCounts || {};
+  const key = token || 'anon';
+  const used = Number(counts[key] || 0);
+  return {
+    isDemo: true,
+    used,
+    limit: DUMMY_AI_MESSAGE_LIMIT,
+    remaining: Math.max(0, DUMMY_AI_MESSAGE_LIMIT - used)
+  };
+}
+
+function consumeFallbackDemoAiQuota(state: StoreState, token: string, user: any) {
+  if (isRealNonDummyUser(user)) {
+    return { isDemo: false, used: 0, limit: null as number | null, remaining: null as number | null };
+  }
+  if (!state.demoAiCounts) state.demoAiCounts = {};
+  const key = token || 'anon';
+  const used = Number(state.demoAiCounts[key] || 0);
+  if (used >= DUMMY_AI_MESSAGE_LIMIT) {
+    const err: any = new Error(
+      'You have reached the 5 message demo limit. Sign in to see more and continue using AI.'
+    );
+    err.status = 429;
+    err.code = 'DEMO_AI_LIMIT_REACHED';
+    err.requiresSignIn = true;
+    err.limit = DUMMY_AI_MESSAGE_LIMIT;
+    err.used = used;
+    err.remaining = 0;
+    throw err;
+  }
+  const nextUsed = used + 1;
+  state.demoAiCounts[key] = nextUsed;
+  saveStore(state);
+  return {
+    isDemo: true,
+    used: nextUsed,
+    limit: DUMMY_AI_MESSAGE_LIMIT,
+    remaining: Math.max(0, DUMMY_AI_MESSAGE_LIMIT - nextUsed)
+  };
+}
+
 export async function handleServerlessFallback<T = any>(
   rawPath: string,
   options: RequestInit = {}
@@ -742,7 +798,9 @@ export async function handleServerlessFallback<T = any>(
     return {
       user,
       ownedRestaurants,
-      unreadNotifications: state.notifications.filter(n => n.user_id === user.id && !n.is_read).length
+      unreadNotifications: state.notifications.filter(n => n.user_id === user.id && !n.is_read).length,
+      isDemoUser: SEED_USER_IDS.has(user.id),
+      demoAiUsage: getFallbackDemoAiUsage(state, token, user)
     } as T;
   }
 
@@ -1113,9 +1171,11 @@ export async function handleServerlessFallback<T = any>(
     return { foods } as T;
   }
 
-  // 6. AI DISCOVERY & VOICE COMMANDS
+  // 6. AI DISCOVERY & VOICE COMMANDS (WITH LIVE GEMINI FREE-MODEL FAILOVER + 5-MSG DEMO CAP)
   if (pathname === '/api/ai/discovery' && method === 'POST') {
     const query = String(body.query || '').trim();
+    const city = String(body.city || 'All').trim();
+    const quota = consumeFallbackDemoAiQuota(state, token, user);
     const qLower = query.toLowerCase();
     const matchedRestaurants = state.restaurants
       .filter(r => `${r.name} ${r.cuisine} ${r.city} ${r.description}`.toLowerCase().includes(qLower))
@@ -1125,35 +1185,119 @@ export async function handleServerlessFallback<T = any>(
       .filter(f => `${f.name} ${f.description} ${f.cuisine}`.toLowerCase().includes(qLower))
       .slice(0, 4);
 
-    const topRests = matchedRestaurants.length > 0 ? matchedRestaurants : state.restaurants.slice(0, 2).map((r, i) => formatPublicRestaurant(state, r, i + 1));
+    const topRests =
+      matchedRestaurants.length > 0
+        ? matchedRestaurants
+        : state.restaurants.slice(0, 2).map((r, i) => formatPublicRestaurant(state, r, i + 1));
     const topFoods = matchedFoods.length > 0 ? matchedFoods : state.foodItems.slice(0, 3);
 
-    return {
-      answer:
+    let aiAnswer = '';
+    let modelUsed = 'fallback';
+    const apiKey = getBrowserGeminiKey();
+    if (apiKey) {
+      try {
+        const resp = await generateWithFreeModelFailover(apiKey, {
+          contents: `You are the Restaurant Hub AI Discovery Concierge.
+A customer asked: "${query}" (City filter: ${city}).
+Verified restaurants: ${JSON.stringify(topRests.map(r => ({ name: r.name, cuisine: r.cuisine, price: r.price_range, rating: r.rating_avg, area: r.area, city: r.city })))}
+Verified dishes: ${JSON.stringify(topFoods.map(f => ({ dish: f.name, restaurant: f.restaurant_name, price: f.discounted_price ?? f.price })))}
+
+Write a warm, helpful, concise 2-3 sentence recommendation referencing ONLY the real restaurants and prices above. Never invent restaurants or prices.`
+        });
+        aiAnswer = resp.text;
+        modelUsed = resp.modelUsed;
+      } catch {
+        // Fall back to deterministic DB summary below
+      }
+    }
+
+    if (!aiAnswer) {
+      aiAnswer =
         matchedFoods.length > 0 || matchedRestaurants.length > 0
           ? `Here are the best matches for "${query}". Tap any dish or restaurant below, or tell me what you'd like me to order for you!`
-          : `I recommend checking out ${topRests.map(r => r.name).join(' and ')}. Popular dishes right now include ${topFoods.map(f => `${f.name} ($${(f.discounted_price ?? f.price).toFixed(2)})`).join(', ')}. Just tell me what you'd like to order!`,
+          : `I recommend checking out ${topRests.map(r => r.name).join(' and ')}. Popular dishes right now include ${topFoods.map(f => `${f.name} ($${(f.discounted_price ?? f.price).toFixed(2)})`).join(', ')}. Just tell me what you'd like to order!`;
+    }
+
+    return {
+      answer: aiAnswer,
       restaurants: topRests,
-      foods: topFoods
+      foods: topFoods,
+      modelUsed,
+      demoAiUsage: quota.isDemo
+        ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+        : undefined
     } as T;
   }
 
   if (pathname === '/api/ai/voice-command' && method === 'POST') {
     const transcript = String(body.transcript || '').trim();
     const formType = body.formType || null;
+    const quota = consumeFallbackDemoAiQuota(state, token, user);
+    const apiKey = getBrowserGeminiKey();
+
     if (formType) {
-      const phoneMatch = transcript.match(/(\+?\d[\d\s-]{6,14}\d)/);
-      const emailMatch = transcript.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
-      return {
-        action: 'form_fill',
-        spokenReply: 'I have filled in the form details from your voice input.',
-        fields: {
+      let extractedFields: Record<string, string> = {};
+      let spokenReply = 'I have filled in the form details from your voice input.';
+      let modelUsed = 'fallback';
+
+      if (apiKey) {
+        try {
+          const resp = await generateWithFreeModelFailover(apiKey, {
+            requireJsonSchema: true,
+            contents: `Extract form fields from the user's spoken input for a "${formType}" form on Restaurant Hub.
+User said: "${transcript}"
+Extract only fields mentioned: name, email, phone, address, city, orderType, offerCode, notes, restaurantName, cuisine, area.`,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  spokenReply: { type: Type.STRING },
+                  name: { type: Type.STRING },
+                  email: { type: Type.STRING },
+                  phone: { type: Type.STRING },
+                  address: { type: Type.STRING },
+                  city: { type: Type.STRING },
+                  orderType: { type: Type.STRING },
+                  offerCode: { type: Type.STRING },
+                  notes: { type: Type.STRING },
+                  restaurantName: { type: Type.STRING },
+                  cuisine: { type: Type.STRING },
+                  area: { type: Type.STRING }
+                },
+                required: ['spokenReply']
+              }
+            }
+          });
+          modelUsed = resp.modelUsed;
+          const parsed = JSON.parse(resp.text);
+          spokenReply = parsed.spokenReply || spokenReply;
+          for (const k of ['name', 'email', 'phone', 'address', 'city', 'orderType', 'offerCode', 'notes', 'restaurantName', 'cuisine', 'area']) {
+            if (parsed[k] && String(parsed[k]).trim()) extractedFields[k] = String(parsed[k]).trim();
+          }
+        } catch {}
+      }
+
+      if (Object.keys(extractedFields).length === 0) {
+        const phoneMatch = transcript.match(/(\+?\d[\d\s-]{6,14}\d)/);
+        const emailMatch = transcript.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+        extractedFields = {
           name: user?.name || 'Abdul Ahad',
           phone: phoneMatch ? phoneMatch[1].trim() : user?.phone || '+92 321 8889900',
           email: emailMatch ? emailMatch[1].trim() : user?.email || '',
           address: transcript,
           notes: transcript
-        }
+        };
+      }
+
+      return {
+        action: 'form_fill',
+        spokenReply,
+        modelUsed,
+        fields: extractedFields,
+        demoAiUsage: quota.isDemo
+          ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+          : undefined
       } as T;
     }
 
@@ -1161,19 +1305,42 @@ export async function handleServerlessFallback<T = any>(
     const matchedFoods = state.foodItems.filter(f => qLower.includes(f.name.toLowerCase()));
     const topRests = state.restaurants.slice(0, 2).map((r, i) => formatPublicRestaurant(state, r, i + 1));
     const foods = matchedFoods.length > 0 ? matchedFoods : state.foodItems.slice(0, 3);
-    const answer =
-      matchedFoods.length > 0
-        ? `Found ${matchedFoods.map(f => f.name).join(' and ')} ready to order.`
-        : `Here are our top recommendations for "${transcript}".`;
+    let answer = '';
+    let modelUsed = 'fallback';
+
+    if (apiKey) {
+      try {
+        const resp = await generateWithFreeModelFailover(apiKey, {
+          contents: `You are the Restaurant Hub Voice AI Concierge.
+A user spoke: "${transcript}".
+Verified restaurants: ${JSON.stringify(topRests.map(r => ({ name: r.name, cuisine: r.cuisine, area: r.area })))}
+Verified dishes: ${JSON.stringify(foods.map(f => ({ dish: f.name, restaurant: f.restaurant_name, price: f.discounted_price ?? f.price })))}
+Give a warm, concise 1-2 sentence spoken response referencing ONLY the real options above.`
+        });
+        answer = resp.text;
+        modelUsed = resp.modelUsed;
+      } catch {}
+    }
+
+    if (!answer) {
+      answer =
+        matchedFoods.length > 0
+          ? `Found ${matchedFoods.map(f => f.name).join(' and ')} ready to order.`
+          : `Here are our top recommendations for "${transcript}".`;
+    }
 
     return {
       action: 'search',
       spokenReply: answer,
+      modelUsed,
       searchData: {
         answer,
         restaurants: topRests,
         foods
-      }
+      },
+      demoAiUsage: quota.isDemo
+        ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+        : undefined
     } as T;
   }
 
@@ -1513,19 +1680,96 @@ export async function handleServerlessFallback<T = any>(
 
     if (subPath === 'ai-menu-draft' && method === 'POST') {
       const prompt = String(body.prompt || '');
+      const quota = consumeFallbackDemoAiQuota(state, token, user);
+      const apiKey = getBrowserGeminiKey();
+      if (apiKey) {
+        try {
+          const resp = await generateWithFreeModelFailover(apiKey, {
+            requireJsonSchema: true,
+            contents: `Extract structured menu items for "${restaurant.name}" (${restaurant.cuisine}) from: "${prompt}".`,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  summary: { type: Type.STRING },
+                  items: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        categoryName: { type: Type.STRING },
+                        name: { type: Type.STRING },
+                        description: { type: Type.STRING },
+                        price: { type: Type.NUMBER },
+                        variations: {
+                          type: Type.ARRAY,
+                          items: {
+                            type: Type.OBJECT,
+                            properties: {
+                              name: { type: Type.STRING },
+                              priceDelta: { type: Type.NUMBER }
+                            },
+                            required: ['name', 'priceDelta']
+                          }
+                        },
+                        addons: {
+                          type: Type.ARRAY,
+                          items: {
+                            type: Type.OBJECT,
+                            properties: {
+                              name: { type: Type.STRING },
+                              price: { type: Type.NUMBER }
+                            },
+                            required: ['name', 'price']
+                          }
+                        },
+                        missingDetails: { type: Type.ARRAY, items: { type: Type.STRING } }
+                      },
+                      required: ['categoryName', 'name', 'description', 'price', 'variations', 'addons', 'missingDetails']
+                    }
+                  }
+                },
+                required: ['summary', 'items']
+              }
+            }
+          });
+          const parsed = JSON.parse(resp.text);
+          if (Array.isArray(parsed.items) && parsed.items.length > 0) {
+            return {
+              summary: parsed.summary || `Extracted ${parsed.items.length} menu item(s).`,
+              categoriesDetected: Array.from(new Set(parsed.items.map((i: any) => i.categoryName))),
+              items: parsed.items.map((it: any, idx: number) => ({
+                tempId: `draft_${Date.now()}_${idx}`,
+                ...it
+              })),
+              source: 'gemini',
+              modelUsed: resp.modelUsed,
+              demoAiUsage: quota.isDemo
+                ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+                : undefined
+            } as T;
+          }
+        } catch {}
+      }
       return {
         summary: `Structured menu draft generated from: "${prompt.slice(0, 60)}"`,
         missingDetails: [],
         items: [
           {
+            tempId: `draft_${Date.now()}_0`,
             categoryName: 'Main Course',
             name: 'Chef Signature Platter',
             description: `Prepared fresh according to your instructions: ${prompt.slice(0, 80)}`,
             price: 15.99,
             variations: [{ name: 'Regular', priceDelta: 0 }],
-            addons: []
+            addons: [],
+            missingDetails: []
           }
-        ]
+        ],
+        demoAiUsage: quota.isDemo
+          ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+          : undefined
       } as T;
     }
 
@@ -1562,8 +1806,32 @@ export async function handleServerlessFallback<T = any>(
     }
 
     if (subPath === 'ai-assistant' && method === 'POST') {
+      const prompt = String(body.prompt || '').trim();
+      const quota = consumeFallbackDemoAiQuota(state, token, user);
+      const apiKey = getBrowserGeminiKey();
+      let reply = '';
+      let modelUsed = 'fallback';
+      if (apiKey) {
+        try {
+          const resp = await generateWithFreeModelFailover(apiKey, {
+            contents: `You are the Restaurant Hub Business Operations AI Assistant for "${restaurant.name}" (${restaurant.profile_views} views, ${restaurant.rating_avg}★ rating).
+Owner question: "${prompt}"
+Give concise, actionable advice.`
+          });
+          reply = resp.text;
+          modelUsed = resp.modelUsed;
+        } catch {}
+      }
+      if (!reply) {
+        reply = `Based on ${restaurant.name}'s current metrics (${restaurant.profile_views} profile views and ${restaurant.rating_avg}★ rating), highlighting your top-margin dishes and maintaining a competitive bid in the Spotlight auction will maximize conversion.`;
+      }
       return {
-        answer: `Based on ${restaurant.name}'s current metrics (${restaurant.profile_views} profile views and ${restaurant.rating_avg}★ rating), highlighting your top-margin dishes and maintaining a competitive bid in the Spotlight auction will maximize conversion.`
+        reply,
+        answer: reply,
+        modelUsed,
+        demoAiUsage: quota.isDemo
+          ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+          : undefined
       } as T;
     }
   }

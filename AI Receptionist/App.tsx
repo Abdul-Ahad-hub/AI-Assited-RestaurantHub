@@ -177,12 +177,28 @@ const App: React.FC = () => {
   );
 
   // 1. Load Current User Session
+  const DEMO_USER_IDS = new Set([
+    'usr_admin_1',
+    'usr_owner_abdul',
+    'usr_owner_zaffran',
+    'usr_owner_smash',
+    'usr_customer_1',
+    'usr_customer_2'
+  ]);
+  const [demoAiRemaining, setDemoAiRemaining] = useState<number | null>(null);
+  const isDemoUser = Boolean(user && DEMO_USER_IDS.has(user.id));
+
   const loadAuthSession = useCallback(async () => {
     try {
       const data = await apiFetch('/api/auth/me');
       setUser(data.user || null);
       setOwnedRestaurants(data.ownedRestaurants || []);
       setUnreadNotifications(data.unreadNotifications || 0);
+      if (data.demoAiUsage && typeof data.demoAiUsage.remaining === 'number') {
+        setDemoAiRemaining(data.demoAiUsage.remaining);
+      } else {
+        setDemoAiRemaining(null);
+      }
       if (data.user) {
         setProfileEdit({
           name: data.user.name || '',
@@ -193,6 +209,7 @@ const App: React.FC = () => {
       }
     } catch {
       setUser(null);
+      setDemoAiRemaining(null);
     }
   }, []);
 
@@ -532,6 +549,9 @@ const App: React.FC = () => {
     setAuthToken(null);
     setUser(null);
     setOwnedRestaurants([]);
+    setDemoAiRemaining(null);
+    setIsChatOpen(false);
+    setVoiceFormType(null);
     setView('home');
   };
 
@@ -1658,6 +1678,11 @@ const App: React.FC = () => {
           onSelectRestaurant={rid => handleOpenRestaurant(rid)}
           voiceFormType={voiceFormType}
           startInVoiceMode={Boolean(voiceFormType)}
+          isDemoUser={isDemoUser}
+          initialDemoAiRemaining={demoAiRemaining}
+          onPromptSignIn={() => {
+            handleLogout();
+          }}
           onFormFilled={fields => {
             if (voiceFormCallbackRef.current) {
               voiceFormCallbackRef.current(fields);

@@ -18,6 +18,9 @@ interface ChatInterfaceProps {
   voiceFormType?: VoiceFormFillType;
   onFormFilled?: (fields: Record<string, string>) => void;
   startInVoiceMode?: boolean;
+  isDemoUser?: boolean;
+  initialDemoAiRemaining?: number | null;
+  onPromptSignIn?: () => void;
 }
 
 interface ChatTurn {
@@ -25,6 +28,7 @@ interface ChatTurn {
   text: string;
   restaurants?: any[];
   foods?: any[];
+  requiresSignIn?: boolean;
 }
 
 export const ChatInterface: React.FC<ChatInterfaceProps> = ({
@@ -37,7 +41,10 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   onSearchCompleted,
   voiceFormType = null,
   onFormFilled,
-  startInVoiceMode = false
+  startInVoiceMode = false,
+  isDemoUser = false,
+  initialDemoAiRemaining = null,
+  onPromptSignIn
 }) => {
   const [isTalkMode, setIsTalkMode] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -52,6 +59,21 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [textInput, setTextInput] = useState('');
   const [isSendingText, setIsSendingText] = useState(false);
+  const [demoRemaining, setDemoRemaining] = useState<number | null>(
+    isDemoUser ? (initialDemoAiRemaining ?? 5) : null
+  );
+  const [demoLimitReached, setDemoLimitReached] = useState(false);
+
+  useEffect(() => {
+    if (isDemoUser) {
+      const rem = initialDemoAiRemaining ?? 5;
+      setDemoRemaining(rem);
+      setDemoLimitReached(rem <= 0);
+    } else {
+      setDemoRemaining(null);
+      setDemoLimitReached(false);
+    }
+  }, [isDemoUser, initialDemoAiRemaining]);
 
   const recognitionRef = useRef<any>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -228,6 +250,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         isProcessingRef.current = false;
         setIsProcessingVoice(false);
 
+        if (res.demoAiUsage && typeof res.demoAiUsage.remaining === 'number') {
+          setDemoRemaining(res.demoAiUsage.remaining);
+          if (res.demoAiUsage.remaining <= 0) {
+            setDemoLimitReached(true);
+          }
+        }
+
         if (res.action === 'form_fill' && res.fields && onFormFilledRef.current) {
           onFormFilledRef.current(res.fields);
         } else if (res.action === 'search' && res.searchData) {
@@ -252,9 +281,17 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
       } catch (err: any) {
         isProcessingRef.current = false;
         setIsProcessingVoice(false);
+        if (err?.code === 'DEMO_AI_LIMIT_REACHED' || err?.requiresSignIn) {
+          setDemoRemaining(0);
+          setDemoLimitReached(true);
+          stopVoiceEngine();
+          setVoiceStatusText('Sign in to see more');
+          setVoiceNotice('You have reached the 5 message demo limit. Sign in with your account to continue using AI.');
+          return;
+        }
         const errMsg = err?.message || 'Could not process voice command.';
         setVoiceStatusText('Listening... Speak whenever you are ready');
-        setVoiceNotice(`Note: ${errMsg}. Microphone is still active — keep speaking or tap Apply.`);
+        setVoiceNotice(`Note: ${errMsg}. Microphone is still active. Keep speaking or tap Apply.`);
         if (keepListeningRef.current && recognitionRef.current) {
           try {
             recognitionRef.current.start();
@@ -444,6 +481,17 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
     e.preventDefault();
     const q = textInput.trim();
     if (!q || isSendingText) return;
+    if (demoLimitReached) {
+      setMessages(prev => [
+        ...prev,
+        {
+          role: 'agent',
+          text: 'You have reached the 5 message demo limit. Sign in to see more and continue using AI.',
+          requiresSignIn: true
+        }
+      ]);
+      return;
+    }
     setTextInput('');
     setMessages(prev => [...prev, { role: 'user', text: q }]);
     setIsSendingText(true);
@@ -453,6 +501,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         method: 'POST',
         body: JSON.stringify({ query: q, city: selectedCity })
       });
+      if (data.demoAiUsage && typeof data.demoAiUsage.remaining === 'number') {
+        setDemoRemaining(data.demoAiUsage.remaining);
+        if (data.demoAiUsage.remaining <= 0) {
+          setDemoLimitReached(true);
+        }
+      }
       setMessages(prev => [
         ...prev,
         {
@@ -466,11 +520,19 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         onSearchCompletedRef.current(data);
       }
     } catch (err: any) {
+      const isLimit = err?.code === 'DEMO_AI_LIMIT_REACHED' || err?.requiresSignIn;
+      if (isLimit) {
+        setDemoRemaining(0);
+        setDemoLimitReached(true);
+      }
       setMessages(prev => [
         ...prev,
         {
           role: 'agent',
-          text: err?.message || 'Unable to process request right now.'
+          text: isLimit
+            ? 'You have reached the 5 message demo limit. Sign in to see more and continue using AI.'
+            : err?.message || 'Unable to process request right now.',
+          requiresSignIn: isLimit
         }
       ]);
     } finally {
@@ -527,11 +589,16 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                 : isAiSpeaking
                 ? 'Speaking reply...'
                 : isListening
-                ? 'Mic Active • Auto-Keepalive On'
+                ? 'Mic Active • Auto Keepalive On'
                 : isReconnecting
                 ? 'Keeping mic active...'
                 : 'Mic Paused'}
             </span>
+            {isDemoUser && demoRemaining !== null && (
+              <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-amber-400/20 text-amber-200">
+                Demo: {demoRemaining}/5 left
+              </span>
+            )}
           </div>
           {!voiceFormType && (
             <button
@@ -598,11 +665,24 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
                     Stay in Voice Mode
                   </button>
                 )}
+                {demoLimitReached && onPromptSignIn && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      stopVoiceEngine();
+                      setIsTalkMode(false);
+                      onPromptSignIn();
+                    }}
+                    className="rh-btn-primary px-4 py-2 rounded-xl text-xs font-extrabold shadow"
+                  >
+                    Sign In to Continue
+                  </button>
+                )}
               </div>
             )}
 
             {/* Resume button whenever mic is paused */}
-            {!isListening && !isReconnecting && !isProcessingVoice && !isAiSpeaking && closingCountdown === null && (
+            {!demoLimitReached && !isListening && !isReconnecting && !isProcessingVoice && !isAiSpeaking && closingCountdown === null && (
               <button
                 type="button"
                 onClick={() => startVoiceEngine()}
@@ -707,7 +787,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
           </div>
           <div>
             <h2 className="text-xs sm:text-sm font-extrabold tracking-tight">Why do it manually?</h2>
-            <p className="text-[10px] opacity-90 truncate max-w-[140px]">{currentRestName}</p>
+            <p className="text-[10px] opacity-90 truncate max-w-[160px]">
+              {isDemoUser && demoRemaining !== null
+                ? `Demo: ${demoRemaining}/5 AI messages left`
+                : currentRestName}
+            </p>
           </div>
         </div>
 
@@ -746,6 +830,17 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
               }`}
             >
               {m.text}
+              {m.requiresSignIn && onPromptSignIn && (
+                <div className="mt-2.5 pt-2 border-t border-[#e4e1ee] dark:border-[#322b47]">
+                  <button
+                    type="button"
+                    onClick={onPromptSignIn}
+                    className="rh-btn-primary w-full px-3.5 py-2 rounded-xl text-xs font-extrabold"
+                  >
+                    Sign In to Continue
+                  </button>
+                </div>
+              )}
             </div>
 
             {m.restaurants && m.restaurants.length > 0 && (
@@ -793,34 +888,51 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({
         )}
       </div>
 
-      {/* Input Bar */}
-      <form
-        onSubmit={handleSendText}
-        className="p-3 bg-white dark:bg-[#1d192b] border-t border-[#e4e1ee] dark:border-[#322b47] flex items-center gap-2 shrink-0"
-      >
-        <input
-          type="text"
-          value={textInput}
-          onChange={e => setTextInput(e.target.value)}
-          placeholder="Tell me what you feel like eating..."
-          className="flex-1 bg-[#f3f1f9] dark:bg-[#181524] border border-[#e4e1ee] dark:border-[#322b47] rounded-xl px-3.5 py-2 text-xs outline-none focus:border-[#7c3aed]"
-        />
-        <button
-          type="button"
-          onClick={handleSwitchToTalkMode}
-          className="w-9 h-9 rounded-xl bg-[#f5f3ff] dark:bg-[#7c3aed]/20 text-[#7c3aed] dark:text-[#a78bfa] flex items-center justify-center hover:opacity-85"
-          title="Switch to Talk Mode"
+      {/* Input Bar or Demo Sign-In Gate */}
+      {demoLimitReached ? (
+        <div className="p-3 bg-white dark:bg-[#1d192b] border-t border-[#e4e1ee] dark:border-[#322b47] flex items-center justify-between gap-2 shrink-0">
+          <span className="text-[11px] font-bold text-[#7c3aed] dark:text-[#a78bfa]">
+            Demo limit reached (5/5). Sign in to see more.
+          </span>
+          {onPromptSignIn && (
+            <button
+              type="button"
+              onClick={onPromptSignIn}
+              className="rh-btn-primary px-3.5 py-2 rounded-xl text-xs font-extrabold shrink-0"
+            >
+              Sign In
+            </button>
+          )}
+        </div>
+      ) : (
+        <form
+          onSubmit={handleSendText}
+          className="p-3 bg-white dark:bg-[#1d192b] border-t border-[#e4e1ee] dark:border-[#322b47] flex items-center gap-2 shrink-0"
         >
-          <i className="fas fa-microphone text-xs"></i>
-        </button>
-        <button
-          type="submit"
-          disabled={!textInput.trim() || isSendingText}
-          className="rh-btn-primary px-3.5 py-2 rounded-xl text-xs font-extrabold disabled:opacity-40"
-        >
-          <i className="fas fa-paper-plane"></i>
-        </button>
-      </form>
+          <input
+            type="text"
+            value={textInput}
+            onChange={e => setTextInput(e.target.value)}
+            placeholder="Tell me what you feel like eating..."
+            className="flex-1 bg-[#f3f1f9] dark:bg-[#181524] border border-[#e4e1ee] dark:border-[#322b47] rounded-xl px-3.5 py-2 text-xs outline-none focus:border-[#7c3aed]"
+          />
+          <button
+            type="button"
+            onClick={handleSwitchToTalkMode}
+            className="w-9 h-9 rounded-xl bg-[#f5f3ff] dark:bg-[#7c3aed]/20 text-[#7c3aed] dark:text-[#a78bfa] flex items-center justify-center hover:opacity-85"
+            title="Switch to Talk Mode"
+          >
+            <i className="fas fa-microphone text-xs"></i>
+          </button>
+          <button
+            type="submit"
+            disabled={!textInput.trim() || isSendingText}
+            className="rh-btn-primary px-3.5 py-2 rounded-xl text-xs font-extrabold disabled:opacity-40"
+          >
+            <i className="fas fa-paper-plane"></i>
+          </button>
+        </form>
+      )}
     </div>
   );
 };

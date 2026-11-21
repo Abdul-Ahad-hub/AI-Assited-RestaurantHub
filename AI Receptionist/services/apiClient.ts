@@ -45,7 +45,14 @@ export async function apiFetch<T = any>(path: string, options: RequestInit = {})
     if ((res.status === 404 && !data.error) || res.status >= 500) {
       return handleServerlessFallback<T>(path, options);
     }
-    throw new Error(data.error || `Request failed with status ${res.status}`);
+    const err: any = new Error(data.error || `Request failed with status ${res.status}`);
+    err.status = res.status;
+    if (data.code) err.code = data.code;
+    if (data.requiresSignIn !== undefined) err.requiresSignIn = data.requiresSignIn;
+    if (data.limit !== undefined) err.limit = data.limit;
+    if (data.used !== undefined) err.used = data.used;
+    if (data.remaining !== undefined) err.remaining = data.remaining;
+    throw err;
   }
 
   // Also guard against SPA fallback returning index.html (200 text/html) for /api/* routes on static hosts

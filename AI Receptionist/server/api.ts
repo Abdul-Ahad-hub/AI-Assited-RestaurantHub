@@ -57,8 +57,62 @@ function safeJsonParse<T>(str: string | null | undefined, fallback: T): T {
   }
 }
 
+export const DUMMY_AI_MESSAGE_LIMIT = 5;
+const dummyAiUsageBySession = new Map<string, number>();
+
 function isRealNonDummyUser(user: AuthUser | null): boolean {
   return Boolean(user && !SEED_USER_IDS.has(user.id));
+}
+
+function getDummyAiSessionKey(req: IncomingMessage): string {
+  const authHeader = String(req.headers['authorization'] || '');
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (token) return `tok:${token}`;
+  }
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const remoteIp = forwarded || req.socket?.remoteAddress || 'anon';
+  return `ip:${remoteIp}`;
+}
+
+function getDummyAiUsage(req: IncomingMessage, user: AuthUser | null) {
+  if (isRealNonDummyUser(user)) {
+    return { isDemo: false, used: 0, limit: null as number | null, remaining: null as number | null };
+  }
+  const key = getDummyAiSessionKey(req);
+  const used = dummyAiUsageBySession.get(key) || 0;
+  return {
+    isDemo: true,
+    used,
+    limit: DUMMY_AI_MESSAGE_LIMIT,
+    remaining: Math.max(0, DUMMY_AI_MESSAGE_LIMIT - used)
+  };
+}
+
+function consumeDummyAiQuota(req: IncomingMessage, user: AuthUser | null) {
+  if (isRealNonDummyUser(user)) {
+    return { allowed: true, isDemo: false, used: 0, limit: null as number | null, remaining: null as number | null };
+  }
+  const key = getDummyAiSessionKey(req);
+  const used = dummyAiUsageBySession.get(key) || 0;
+  if (used >= DUMMY_AI_MESSAGE_LIMIT) {
+    return {
+      allowed: false,
+      isDemo: true,
+      used,
+      limit: DUMMY_AI_MESSAGE_LIMIT,
+      remaining: 0
+    };
+  }
+  const nextUsed = used + 1;
+  dummyAiUsageBySession.set(key, nextUsed);
+  return {
+    allowed: true,
+    isDemo: true,
+    used: nextUsed,
+    limit: DUMMY_AI_MESSAGE_LIMIT,
+    remaining: Math.max(0, DUMMY_AI_MESSAGE_LIMIT - nextUsed)
+  };
 }
 
 function formatPublicRestaurant(row: any, activeBidAmount?: number | null, bidRank?: number) {
@@ -159,7 +213,9 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       sendJson(res, 200, {
         user,
         ownedRestaurants,
-        unreadNotifications: Number(unreadRow?.cnt || 0)
+        unreadNotifications: Number(unreadRow?.cnt || 0),
+        isDemoUser: SEED_USER_IDS.has(user.id),
+        demoAiUsage: getDummyAiUsage(req, user)
       });
       return true;
     }
@@ -839,12 +895,29 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         sendJson(res, 400, { error: 'Please provide a discovery question.' });
         return true;
       }
+      const quota = consumeDummyAiQuota(req, user);
+      if (!quota.allowed) {
+        sendJson(res, 429, {
+          error: 'You have reached the 5 message demo limit. Sign in to see more and continue using AI.',
+          code: 'DEMO_AI_LIMIT_REACHED',
+          requiresSignIn: true,
+          limit: quota.limit,
+          used: quota.used,
+          remaining: 0
+        });
+        return true;
+      }
       const result = await runCustomerDiscoveryAI({
         query,
         city,
         userId: user?.id || null
       });
-      sendJson(res, 200, result);
+      sendJson(res, 200, {
+        ...result,
+        demoAiUsage: quota.isDemo
+          ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+          : undefined
+      });
       return true;
     }
 
@@ -858,6 +931,18 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         sendJson(res, 400, { error: 'Please speak or provide a voice transcript.' });
         return true;
       }
+      const quota = consumeDummyAiQuota(req, user);
+      if (!quota.allowed) {
+        sendJson(res, 429, {
+          error: 'You have reached the 5 message demo limit. Sign in to see more and continue using AI.',
+          code: 'DEMO_AI_LIMIT_REACHED',
+          requiresSignIn: true,
+          limit: quota.limit,
+          used: quota.used,
+          remaining: 0
+        });
+        return true;
+      }
       const result = await processVoiceCommandAI({
         transcript,
         formType,
@@ -865,7 +950,12 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         restaurantId,
         userId: user?.id || null
       });
-      sendJson(res, 200, result);
+      sendJson(res, 200, {
+        ...result,
+        demoAiUsage: quota.isDemo
+          ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+          : undefined
+      });
       return true;
     }
 
@@ -1673,6 +1763,17 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         if (!prompt) {
           return sendJson(res, 400, { error: 'Please enter or speak menu instructions.' }), true;
         }
+        const quota = consumeDummyAiQuota(req, user);
+        if (!quota.allowed) {
+          return sendJson(res, 429, {
+            error: 'You have reached the 5 message demo limit. Sign in to see more and continue using AI.',
+            code: 'DEMO_AI_LIMIT_REACHED',
+            requiresSignIn: true,
+            limit: quota.limit,
+            used: quota.used,
+            remaining: 0
+          }), true;
+        }
         const draft = await generateMenuDraftFromPrompt(
           prompt,
           restaurant.name,
@@ -1680,7 +1781,12 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
           user.id,
           restaurantId
         );
-        sendJson(res, 200, draft);
+        sendJson(res, 200, {
+          ...draft,
+          demoAiUsage: quota.isDemo
+            ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+            : undefined
+        });
         return true;
       }
 
@@ -1760,12 +1866,28 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         const body = await parseBody(req);
         const prompt = String(body.prompt || '').trim();
         if (!prompt) return sendJson(res, 400, { error: 'Prompt is required' }), true;
+        const quota = consumeDummyAiQuota(req, user);
+        if (!quota.allowed) {
+          return sendJson(res, 429, {
+            error: 'You have reached the 5 message demo limit. Sign in to see more and continue using AI.',
+            code: 'DEMO_AI_LIMIT_REACHED',
+            requiresSignIn: true,
+            limit: quota.limit,
+            used: quota.used,
+            remaining: 0
+          }), true;
+        }
         const result = await runRestaurantOwnerAssistant({
           restaurantId,
           userId: user.id,
           prompt
         });
-        sendJson(res, 200, result);
+        sendJson(res, 200, {
+          ...result,
+          demoAiUsage: quota.isDemo
+            ? { used: quota.used, limit: quota.limit, remaining: quota.remaining }
+            : undefined
+        });
         return true;
       }
 
