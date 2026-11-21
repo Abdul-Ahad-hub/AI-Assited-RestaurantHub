@@ -1,13 +1,14 @@
 import crypto from 'node:crypto';
-import { GoogleGenAI, Type } from '@google/genai';
+import { Type } from '@google/genai';
 import { getDb } from './db';
+import { generateWithFreeModelFailover } from '../services/geminiModelRouter';
 
-function getAiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || '';
+function getGeminiApiKey(): string {
+  const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim();
   if (!apiKey || apiKey === 'PLACEHOLDER_API_KEY') {
-    return null;
+    return '';
   }
-  return new GoogleGenAI({ apiKey });
+  return apiKey;
 }
 
 export interface StructuredMenuDraftItem {
@@ -32,17 +33,19 @@ export async function generateMenuDraftFromPrompt(
   categoriesDetected: string[];
   items: StructuredMenuDraftItem[];
   source: 'gemini' | 'smart_parser';
+  modelUsed: string;
 }> {
   const db = getDb();
-  const ai = getAiClient();
+  const apiKey = getGeminiApiKey();
   let items: StructuredMenuDraftItem[] = [];
   let summary = '';
   let source: 'gemini' | 'smart_parser' = 'smart_parser';
+  let modelUsed = 'smart_parser';
 
-  if (ai) {
+  if (apiKey) {
     try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+      const { text: responseText, modelUsed: usedModel } = await generateWithFreeModelFailover(apiKey, {
+        requireJsonSchema: true,
         contents: `You are the Restaurant Hub AI Menu Architect for "${restaurantName}" (${defaultCuisine}).
 Extract a structured menu draft from the restaurant owner's input below.
 Owner input:
@@ -54,7 +57,7 @@ Rules:
 1. Identify category names (e.g. "Biryani", "Appetizers", "Burgers", "Drinks", "Main Course").
 2. Extract each food item's exact name and numeric price.
 3. If the owner did not provide a description, write a concise, appetizing 1-sentence culinary description matching the item name and ${defaultCuisine} cuisine.
-4. Suggest 1-2 sensible variations (e.g., Regular, Large, Spicy) if relevant, and flag any missing details (e.g., "Generated description — please review", "Check portion size").`,
+4. Suggest 1-2 sensible variations (e.g., Regular, Large, Spicy) if relevant, and flag any missing details (e.g., "Generated description, please review", "Check portion size").`,
         config: {
           responseMimeType: 'application/json',
           responseSchema: {
@@ -106,8 +109,8 @@ Rules:
         }
       });
 
-      if (response.text) {
-        const parsed = JSON.parse(response.text);
+      if (responseText) {
+        const parsed = JSON.parse(responseText);
         if (Array.isArray(parsed.items) && parsed.items.length > 0) {
           items = parsed.items.map((it: any, idx: number) => ({
             tempId: `draft_${Date.now()}_${idx}`,
@@ -121,10 +124,11 @@ Rules:
           }));
           summary = parsed.summary || `Extracted ${items.length} menu items across ${new Set(items.map(i => i.categoryName)).size} categories.`;
           source = 'gemini';
+          modelUsed = usedModel;
         }
       }
     } catch (err) {
-      console.warn('Gemini menu draft fallback triggered:', err);
+      console.warn('Gemini menu draft failover exhausted, using smart parser:', err);
     }
   }
 
@@ -149,7 +153,7 @@ Rules:
     new Date().toISOString()
   );
 
-  return { summary, categoriesDetected, items, source };
+  return { summary, categoriesDetected, items, source, modelUsed };
 }
 
 function fallbackParseMenuDraft(prompt: string, defaultCuisine: string): StructuredMenuDraftItem[] {
@@ -332,11 +336,11 @@ export async function runCustomerDiscoveryAI(params: {
   }));
 
   let aiAnswer = '';
-  const ai = getAiClient();
-  if (ai) {
+  let modelUsed = 'fallback';
+  const apiKey = getGeminiApiKey();
+  if (apiKey) {
     try {
-      const resp = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+      const resp = await generateWithFreeModelFailover(apiKey, {
         contents: `You are the Restaurant Hub AI Discovery Concierge.
 A customer asked: "${q}" (City filter: ${params.city || 'All'}).
 Here are the verified database results retrieved from Restaurant Hub:
@@ -346,6 +350,7 @@ Dishes: ${JSON.stringify(topFoods.map(f => ({ dish: f.name, restaurant: f.restau
 Write a warm, helpful, concise 2-3 sentence recommendation referencing ONLY the real restaurants and prices above. Never invent restaurants or prices.`
       });
       aiAnswer = resp.text || '';
+      modelUsed = resp.modelUsed;
     } catch {
       // Fallback below
     }
@@ -376,7 +381,8 @@ Write a warm, helpful, concise 2-3 sentence recommendation referencing ONLY the 
   return {
     answer: aiAnswer,
     restaurants: topRestaurants,
-    foods: topFoods
+    foods: topFoods,
+    modelUsed
   };
 }
 
@@ -412,11 +418,11 @@ export async function runRestaurantOwnerAssistant(params: {
   };
 
   let reply = '';
-  const ai = getAiClient();
-  if (ai) {
+  let modelUsed = 'fallback';
+  const apiKey = getGeminiApiKey();
+  if (apiKey) {
     try {
-      const resp = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+      const resp = await generateWithFreeModelFailover(apiKey, {
         contents: `You are the Restaurant Hub Business Operations AI Assistant for "${restaurant.name}".
 Here is the restaurant's live verified database performance snapshot:
 ${JSON.stringify(contextSnapshot, null, 2)}
@@ -426,6 +432,7 @@ Owner question/request: "${params.prompt}"
 Provide actionable, data-backed advice based strictly on their real metrics, menu items, and reviews above. Format clearly with bullet points where helpful.`
       });
       reply = resp.text || '';
+      modelUsed = resp.modelUsed;
     } catch {
       // Fallback below
     }
@@ -453,7 +460,7 @@ Provide actionable, data-backed advice based strictly on their real metrics, men
     new Date().toISOString()
   );
 
-  return { reply, snapshot: contextSnapshot };
+  return { reply, snapshot: contextSnapshot, modelUsed };
 }
 
 export async function processVoiceCommandAI(params: {
@@ -465,6 +472,7 @@ export async function processVoiceCommandAI(params: {
 }): Promise<{
   action: 'form_fill' | 'order' | 'search' | 'reply';
   spokenReply: string;
+  modelUsed?: string;
   fields?: Record<string, string>;
   orderData?: {
     items: { name: string; quantity: number }[];
@@ -475,20 +483,22 @@ export async function processVoiceCommandAI(params: {
     answer: string;
     restaurants: any[];
     foods: any[];
+    modelUsed?: string;
   };
 }> {
   const text = (params.transcript || '').trim();
-  const ai = getAiClient();
+  const apiKey = getGeminiApiKey();
 
   // 1. If opened from a form ("AI Fill with Voice"), extract form fields
   if (params.formType) {
     let extractedFields: Record<string, string> = {};
     let spokenReply = 'I have filled in the form fields from your voice input.';
+    let modelUsed = 'fallback';
 
-    if (ai) {
+    if (apiKey) {
       try {
-        const resp = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
+        const resp = await generateWithFreeModelFailover(apiKey, {
+          requireJsonSchema: true,
           contents: `Extract form fields from the user's spoken voice input for a "${params.formType}" form on Restaurant Hub.
 User said: "${text}"
 
@@ -528,6 +538,7 @@ Possible fields to extract (only include fields mentioned or implied by the user
         });
 
         if (resp.text) {
+          modelUsed = resp.modelUsed;
           const parsed = JSON.parse(resp.text);
           spokenReply = parsed.spokenReply || spokenReply;
           for (const key of [
@@ -587,6 +598,7 @@ Possible fields to extract (only include fields mentioned or implied by the user
     return {
       action: 'form_fill',
       spokenReply,
+      modelUsed,
       fields: extractedFields
     };
   }
@@ -601,6 +613,7 @@ Possible fields to extract (only include fields mentioned or implied by the user
   return {
     action: 'search',
     spokenReply: discovery.answer,
+    modelUsed: discovery.modelUsed,
     searchData: discovery
   };
 }
